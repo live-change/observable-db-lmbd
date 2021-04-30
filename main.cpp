@@ -1,10 +1,11 @@
 #include <stdio.h>
 #include <boost/program_options.hpp>
-#include <lmdb.h>
 #include <uWebSockets/App.h>
 #include <filesystem>
-#include <concurrentqueue/blockingconcurrentqueue.h>
+#include <unordered_set>
 #include "PacketBuffer.h"
+#include "range.h"
+#include "Database.h"
 
 namespace options {
   std::string dir;
@@ -37,411 +38,6 @@ void parseOptions(int argc, char** argv) {
   if (vm.count("port")) options::port = vm["port"].as<int>();
   if (vm.count("threads")) options::port = vm["threads"].as<int>();
 }
-
-std::vector<std::thread> lmdbThreadPool;
-moodycamel::BlockingConcurrentQueue<std::function<void()>> taskQueue;
-
-void workerThread() {
-  while(true) {
-    std::function<void()> function;
-    taskQueue.wait_dequeue(function);
-    function();
-  }
-}
-
-namespace RangeFlag {
- // static const uint8_t Reverse = 0;
-  static const uint8_t Gt = 1;
-  static const uint8_t Gte = 2;
-  static const uint8_t Lt = 4;
-  static const uint8_t Lte = 8;
-}
-
-struct RangeView {
-  uint8_t flags;
-  std::string_view gt;
-  std::string_view lt;
-  RangeView(net::PacketBuffer& packet) {
-    flags = packet.readU8();
-    if(flags & (RangeFlag::Gt|RangeFlag::Gte)) {
-      int keySize = packet.readU16();
-      char* key = packet.readPointer(keySize);
-      gt = std::string_view(key, keySize);
-    }
-    if(flags & (RangeFlag::Lt|RangeFlag::Lte)) {
-      int keySize = packet.readU16();
-      char* key = packet.readPointer(keySize);
-      lt = std::string_view(key, keySize);
-    }
-  }
-};
-
-struct Range {
-  uint8_t flags;
-  std::string gt;
-  std::string lt;
-  Range(RangeView rv) {
-    flags = rv.flags;
-    gt = rv.gt;
-    lt = rv.lt;
-  }
-};
-
-class Observation {
-protected:
-  uWS::Loop* loop; // Observable logic are loop-based for simpler logic, I/O operations work in I/O threads
-public:
-  virtual void close();
-};
-
-class ObjectObservation : public Observation {
-
-};
-
-class RangeObservation : public Observation {
-
-};
-
-class CountObservation : public Observation {
-
-};
-
-class Database;
-
-
-class Store : public std::enable_shared_from_this<Store> {
-private:
-  std::shared_ptr<Database> database;
-  std::vector<std::weak_ptr<Observation>> observations;
-  std::string name;
-  MDB_env* env;
-  MDB_dbi dbi;
-  std::mutex stateMutex;
-  bool finished;
-public:
-
-  Store(std::shared_ptr<Database> databasep, std::string namep, MDB_env* envp)
-  : database(databasep), name(namep), env(envp) {
-
-  }
-
-  int create() {
-    MDB_txn* txn;
-    mdb_txn_begin(env, nullptr, 0, &txn);
-    int ret = mdb_dbi_open(txn, name.c_str(), MDB_CREATE, &dbi);
-    return ret;
-  }
-
-  bool open() {
-    MDB_txn* txn;
-    mdb_txn_begin(env, nullptr, 0, &txn);
-    int ret = mdb_dbi_open(txn, name.c_str(), 0, &dbi);
-    mdb_txn_commit(txn);
-    return ret == 0;
-  }
-
-  void close() {
-    std::lock_guard lock(stateMutex);
-    finished = true;
-    for(auto const& weak : observations) {
-      std::shared_ptr<Observation> observation = weak.lock();
-      if(observation) observation->close();
-    }
-    mdb_dbi_close(env, dbi);
-  }
-
-  void drop() {
-    MDB_txn* txn;
-    mdb_txn_begin(env, nullptr, 0, &txn);
-    /*int ret = */mdb_drop(txn, dbi, 1);
-    mdb_txn_commit(txn);
-  }
-
-  void put(std::string_view keyp, std::string_view valuep,
-           std::function<void()> onOk) {
-    std::shared_ptr<Store> self = shared_from_this();
-    uWS::Loop* loop = uWS::Loop::get();
-    std::string key = std::string(keyp);
-    std::string value = std::string(valuep);
-    taskQueue.enqueue([loop, self, this, key, value, onOk]() {
-      if(finished) {
-        loop->defer([onOk]() { onOk(); });
-        return;
-      }
-      MDB_txn *txn;
-      mdb_txn_begin(env, nullptr, 0, &txn);
-      MDB_val keyVal = { .mv_size = key.size(), .mv_data = (void*)key.data() };
-      MDB_val valueVal = { .mv_size = value.size(), .mv_data = (void*)value.data() };
-      /*int ret = */mdb_put(txn, dbi, &keyVal, &valueVal, 0);
-      mdb_txn_commit(txn);
-      loop->defer([onOk]() {
-        onOk();
-      });
-    });
-  }
-  void del(std::string_view keyp,
-           std::function<void()> onOk) {
-    std::shared_ptr<Store> self = shared_from_this();
-    uWS::Loop* loop = uWS::Loop::get();
-    std::string key = std::string(keyp);
-    taskQueue.enqueue([loop, self, this, key, onOk]() {
-      if(finished) {
-        loop->defer([onOk]() { onOk(); });
-        return;
-      }
-      MDB_txn *txn;
-      mdb_txn_begin(env, nullptr, 0, &txn);
-      MDB_val keyVal = { .mv_size = key.size(), .mv_data = (void*)key.data() };
-      /*int ret = */mdb_del(txn, dbi, &keyVal, 0);
-      mdb_txn_commit(txn);
-      loop->defer([onOk]() {
-        onOk();
-      });
-    });
-  }
-  void get(std::string_view keyp,
-           std::function<void(const std::string&)> callback) {
-    std::shared_ptr<Store> self = shared_from_this();
-    uWS::Loop* loop = uWS::Loop::get();
-    std::string key = std::string(keyp);
-    taskQueue.enqueue([loop, self, this, key, callback]() {
-      if(finished) {
-        loop->defer([callback]() { callback(""); });
-        return;
-      }
-      MDB_txn *txn;
-      mdb_txn_begin(env, nullptr, MDB_RDONLY, &txn);
-      MDB_val keyVal = { .mv_size = key.size(), .mv_data = (void*)key.data() };
-      MDB_val valueVal;
-      int ret = mdb_get(txn, dbi, &keyVal, &valueVal);
-      mdb_txn_commit(txn);
-      std::string value = ret == MDB_NOTFOUND ? "" : std::string((const char*)valueVal.mv_data, valueVal.mv_size);
-      loop->defer([callback, value]() {
-        callback(value);
-      });
-    });
-  }
-  void getRange(RangeView rangeView,
-                std::function<void(const std::string& key, const std::string& value)> onValue,
-                std::function<void()> onEnd) {
-    std::shared_ptr<Store> self = shared_from_this();
-    uWS::Loop* loop = uWS::Loop::get();
-    Range range(rangeView);
-    taskQueue.enqueue([loop, self, this, range, onValue, onEnd]() {
-      if(finished) {
-        loop->defer([onEnd]() { onEnd(); });
-        return;
-      }
-      MDB_txn *txn;
-      mdb_txn_begin(env, nullptr, MDB_RDONLY, &txn);
-      MDB_cursor *cursor;
-      mdb_cursor_open(txn, dbi, &cursor);
-      //MDB_val keyVal;
-      //MDB_val valueVal;
-
-      /*
-
-       const min = range.gt || range.gte
-          const max = range.lt || range.lte
-          if(range.reverse) {
-            if(max) {
-              found = cursor.goToRange(max)
-              if(!found) found = cursor.goToLast()
-            } else {
-              found = cursor.goToLast()
-            }
-            while((!range.limit || keys.length < range.limit) && found !== null) {
-              if(range.gt && found <= range.gt) break;
-              if(range.gte && found < range.gte) break;
-              if((!range.lt || found < range.lt) && (!range.lte || found <= range.lte)) {
-                // key in range, skip keys outside range
-                keys.push(found)
-              }
-              found = cursor.goToPrev()
-            }
-          } else {
-            if(min) {
-              found = cursor.goToRange(min)
-            } else {
-              found = cursor.goToFirst()
-            }
-            while((!range.limit || keys.length < range.limit) && found !== null) {
-              if(range.lt && found >= range.lt) break;
-              if(range.lte && found > range.lte) break;
-              if((!range.gt || found > range.gt) && (!range.gte || found >= range.gte)) {
-                // key in range, skip keys outside range
-                keys.push(found)
-              }
-              //console.log("    GO TO NEXT [")
-              found = cursor.goToNext()
-              //console.log("    ] GO TO NEXT")
-            }
-          }
-
-       */
-
-      mdb_cursor_close(cursor);
-      mdb_txn_abort(txn);
-    });
-  }
-
-  void getCount(RangeView rangeView,
-                std::function<void(int)> onCount) {
-    //std::shared_ptr<Store> self = shared_from_this();
-    //uWS::Loop* loop = uWS::Loop::get();
-    //Range range(rangeView);
-/*    taskQueue.enqueue([loop, self, this, range]() {
-
-    });*/
-  }
-
-  std::shared_ptr<Observation> observeObject(std::string_view key,
-                                             std::function<void (const std::string& value)> onState) {
-    return nullptr;
-  }
-
-  std::shared_ptr<Observation> observeRange(RangeView rangeView,
-                    std::function<void (const std::string& key, const std::string& value)> onResult,
-                    std::function<void()> onChanges) {
-    return nullptr;
-  }
-
-  std::shared_ptr<Observation> observeCount(RangeView rangeView,
-                    std::function<void(int)> onCount) {
-    return nullptr;
-  }
-
-};
-
-class Database : public std::enable_shared_from_this<Database> {
-private:
-  MDB_env* env;
-  std::mutex stateMutex;
-  std::map<std::string, std::weak_ptr<Store>> stores;
-  bool finished = false;
-public:
-  Database(std::string path) {
-    mdb_env_create(&env);
-    mdb_env_set_mapsize(env, 1024*1024*1024);
-    mdb_env_set_maxdbs(env, 10000);
-    mdb_env_set_maxreaders(env, 32);
-    mdb_env_open(env, path.c_str(), MDB_NOSYNC, 0664);
-  }
-
-  void getStore(std::string storeName, std::function<void(std::shared_ptr<Store>)> callback) {
-    std::shared_ptr<Database> self = shared_from_this();
-    uWS::Loop* loop = uWS::Loop::get();
-    taskQueue.enqueue([storeName, callback, loop, self, this]() {
-      std::lock_guard<std::mutex> stateLock(stateMutex);
-      if(finished) {
-        callback(nullptr);
-        return;
-      }
-      std::shared_ptr<Store> store = nullptr;
-      auto it = stores.find(storeName);
-      if(it != stores.end()) {
-        store = it->second.lock();
-      }
-      if(store != nullptr) {
-        loop->defer([callback, store](){
-          callback(store);
-        });
-        return;
-      }
-      store = std::make_shared<Store>(self, storeName, env);
-      if(store->open()) {
-        loop->defer([callback, store]() {
-          callback(store);
-        });
-      } else {
-        loop->defer([callback, store]() {
-          callback(nullptr);
-        });
-      }
-    });
-  }
-  void createStore(std::string name,
-                   std::function<void()> onOk, std::function<void(std::string)> onError) {
-    std::shared_ptr<Database> self = shared_from_this();
-    uWS::Loop* loop = uWS::Loop::get();
-    taskQueue.enqueue([name, onOk, onError, loop, self, this]() {
-      std::lock_guard<std::mutex> stateLock(stateMutex);
-      if(finished) {
-        loop->defer([onError]() {
-          onError("closed");
-        });
-        return;
-      }
-      auto it = stores.find(name);
-      if(it != stores.end()) {
-        loop->defer([onError]() {
-          onError("exists");
-        });
-        return;
-      }
-      std::shared_ptr<Store> store = std::make_shared<Store>(self, name, env);
-
-      int ret = store->create();
-      if(ret == 0) {
-        loop->defer([onOk]() {
-          onOk();
-        });
-      } else {
-        fprintf(stderr, "MDB CREATE RET %d\n", ret);
-        if(ret == MDB_BAD_VALSIZE) {
-          loop->defer([onError]() {
-            onError("max_bad_valsize");
-          });
-        } else if (ret == MDB_DBS_FULL) {
-          loop->defer([onError]() {
-            onError("dbs_full");
-          });
-        }
-      }
-    });
-  }
-  void deleteStore(std::string name,
-                   std::function<void()> onOk, std::function<void(std::string)> onError) {
-    std::shared_ptr<Database> self = shared_from_this();
-    uWS::Loop* loop = uWS::Loop::get();
-    taskQueue.enqueue([name, onOk, onError, loop, self, this]() {
-      std::lock_guard<std::mutex> stateLock(stateMutex);
-      auto it = stores.find(name);
-      std::shared_ptr<Store> store = nullptr;
-      if(it != stores.end()) {
-        store = it->second.lock();
-      }
-      if(store == nullptr) {
-        store = std::make_shared<Store>(self, name, env);
-        if(!store->open()) {
-          loop->defer([onError, store]() {
-            onError("not_found");
-          });
-          return;
-        }
-      }
-      store->drop();
-      if(it != stores.end()) {
-        stores.erase(it);
-      }
-      loop->defer([onOk]() {
-        onOk();
-      });
-    });
-  }
-
-  void close() {
-    std::lock_guard lock(stateMutex);
-    finished = true;
-    for(auto const& [key, val] : stores) {
-      std::shared_ptr<Store> store = val.lock();
-      store->close();
-    }
-    mdb_env_sync(env, 1);
-    mdb_env_close(env);
-  }
-
-};
 
 std::map<std::string, std::weak_ptr<Database>> databases;
 std::mutex databasesMutex;
@@ -557,6 +153,7 @@ private:
     Result = 80,
     ResultPut = 81,
     ResultCount = 82,
+    ResultNotFound = 83,
     ResultsChanges = 88,
     ResultsDone = 89
   };
@@ -574,8 +171,8 @@ public:
   }
   void handleMessage(char* buffer, int size) {
     net::PacketBuffer packet(buffer, size);
-    fprintf(stderr,"RECEIVED PACKET!\n");
-    packet.print();
+    //fprintf(stderr,"RECEIVED PACKET!\n");
+    //packet.print();
     uint8_t opCode = packet.readU8();
     std::shared_ptr<ClientConnection> self = shared_from_this();
     std::weak_ptr<ClientConnection> weak = self;
@@ -611,6 +208,7 @@ public:
       case (uint8_t)OpCode::OpenStore: {
         int requestId = packet.readU32();
         int storeId = openStores.size();
+        openStores.push_back(nullptr);
         std::string databaseName = packet.readString(packet.readU8());
         std::string storeName = packet.readString(packet.readU8());
         getDatabase(databaseName, [requestId, storeId, self, storeName](
@@ -692,7 +290,6 @@ public:
         store->put(key, value, [requestId, self](){
           self->sendOk(requestId);
         });
-        sendOk(requestId);
       } break;
       case (uint8_t)OpCode::Delete: {
         int requestId = packet.readU32();
@@ -708,7 +305,24 @@ public:
         store->del(key, [requestId, self](){
           self->sendOk(requestId);
         });
-        sendOk(requestId);
+      } break;
+      case (uint8_t)OpCode::DeleteRange: {
+        int requestId = packet.readU32();
+        int storeId = packet.readU32();
+        std::shared_ptr<Store> store = storeId < openStores.size() ? openStores[storeId] : nullptr;
+        if (storeId >= openStores.size() || !openStores[storeId]) {
+          sendError(requestId, "not_opened");
+          break;
+        }
+        RangeView range(packet);
+        store->deleteRange(range, [this, requestId](int count, const std::string& lastKey) {
+          net::PacketBuffer resultPacket(12);
+          resultPacket.writeU8((uint8_t) OpCode::ResultCount);
+          resultPacket.writeU32(requestId);
+          resultPacket.writeU32(count);
+          resultPacket.flip();
+          sendCallback(resultPacket.getPointer(0), resultPacket.size());
+        });
       } break;
 
       case (uint8_t)OpCode::Get: {
@@ -722,13 +336,21 @@ public:
         int keySize = packet.readU16();
         char* keyData = packet.readPointer(keySize);
         std::string_view key(keyData, keySize);
-        store->get(key, [this, requestId](const std::string& obj) {
-          net::PacketBuffer resultPacket(obj.size() + 12);
-          resultPacket.writeU8((uint8_t)OpCode::Result);
-          resultPacket.writeU32(requestId);
-          resultPacket.writeBytes(obj.data(), obj.size());
-          resultPacket.flip();
-          sendCallback(resultPacket.getPointer(0), resultPacket.size());
+        store->get(key, [this, requestId](bool found, const std::string& obj) {
+          if(found) {
+            net::PacketBuffer resultPacket(obj.size() + 12);
+            resultPacket.writeU8((uint8_t) OpCode::Result);
+            resultPacket.writeU32(requestId);
+            resultPacket.writeBytes(obj.data(), obj.size());
+            resultPacket.flip();
+            sendCallback(resultPacket.getPointer(0), resultPacket.size());
+          } else {
+            net::PacketBuffer resultPacket(10);
+            resultPacket.writeU8((uint8_t) OpCode::ResultNotFound);
+            resultPacket.writeU32(requestId);
+            resultPacket.flip();
+            sendCallback(resultPacket.getPointer(0), resultPacket.size());
+          }
         });
       } break;
       case (uint8_t)OpCode::GetRange: {
@@ -767,17 +389,19 @@ public:
           break;
         }
         RangeView range(packet);
-        store->getCount(range, [this, requestId](int count) {
-          net::PacketBuffer resultPacket(12);
+        store->getCount(range, [this, requestId](int count, const std::string& lastKey) {
+          net::PacketBuffer resultPacket(12 + lastKey.length());
           resultPacket.writeU8((uint8_t) OpCode::ResultCount);
           resultPacket.writeU32(requestId);
           resultPacket.writeU32(count);
+          resultPacket.writeString(lastKey);
           resultPacket.flip();
           sendCallback(resultPacket.getPointer(0), resultPacket.size());
         });
       } break;
 
       case (uint8_t)OpCode::Observe: {
+        fprintf(stderr, "RECEIVED OBSERVE\n");
         int requestId = packet.readU32();
         if(observations.find(requestId) != observations.end()) {
           sendError(requestId, "exists");
@@ -792,14 +416,23 @@ public:
         int keySize = packet.readU16();
         char* keyData = packet.readPointer(keySize);
         std::string_view key = std::string_view(keyData, keySize);
+        fprintf(stderr, "OBSERVE OBJECT\n");
         std::shared_ptr<Observation> observation =
-          store->observeObject(key, [requestId, this](const std::string& value){
-            net::PacketBuffer resultPacket(value.size() + 12);
-            resultPacket.writeU8((uint8_t)OpCode::Result);
-            resultPacket.writeU32(requestId);
-            resultPacket.writeBytes(value.data(), value.size());
-            resultPacket.flip();
-            sendCallback(resultPacket.getPointer(0), resultPacket.size());
+          store->observeObject(key, [requestId, this](bool found, const std::string& value){
+            if(found) {
+              net::PacketBuffer resultPacket(value.size() + 12);
+              resultPacket.writeU8((uint8_t) OpCode::Result);
+              resultPacket.writeU32(requestId);
+              resultPacket.writeBytes(value.data(), value.size());
+              resultPacket.flip();
+              sendCallback(resultPacket.getPointer(0), resultPacket.size());
+            } else {
+              net::PacketBuffer resultPacket(10);
+              resultPacket.writeU8((uint8_t) OpCode::ResultNotFound);
+              resultPacket.writeU32(requestId);
+              resultPacket.flip();
+              sendCallback(resultPacket.getPointer(0), resultPacket.size());
+            }
           });
         observations[requestId] = observation;
       } break;
@@ -867,8 +500,9 @@ public:
           sendError(requestId, "not_found");
           break;
         }
+        std::shared_ptr<Observation> observation = it->second;
         observations.erase(it);
-        it->second->close();
+        observation->close();
       } break;
     }
   }
@@ -879,8 +513,7 @@ public:
     resultPacket.writeU32(requestId);
     resultPacket.writeString(error);
     resultPacket.flip();
-    fprintf(stderr,"SEND PACKET!\n");
-    resultPacket.print();
+    fprintf(stderr,"SEND ERROR %s!\n", error.c_str());
     sendCallback(resultPacket.getPointer(0), resultPacket.size());
   }
   
@@ -889,8 +522,8 @@ public:
     resultPacket.writeU8((uint8_t)OpCode::Ok);
     resultPacket.writeU32(requestId);
     resultPacket.flip();
-    fprintf(stderr,"SEND PACKET!\n");
-    resultPacket.print();
+/*    fprintf(stderr,"SEND PACKET!\n");
+    resultPacket.print();*/
     sendCallback(resultPacket.getPointer(0), resultPacket.size());
   }
   
@@ -933,6 +566,9 @@ int main(int argc, char** argv) {
         PerSocketData* socketData = (PerSocketData*)ws->getUserData();
         socketData->connection = std::make_shared<ClientConnection>();
         socketData->connection->handleOpen([ws](char* data, int size) {
+          if(data[0] == 0x1e) {
+            fprintf(stderr, "WTF?!\n");
+          }
           ws->send(std::string_view(data, size), uWS::OpCode::BINARY);
         }, [ws]() {
           ws->close();
