@@ -5,6 +5,8 @@
 #ifndef OBSERVABLE_DB_LMDB_RANGE_H
 #define OBSERVABLE_DB_LMDB_RANGE_H
 
+#include <boost/icl/interval_map.hpp>
+
 #include "PacketBuffer.h"
 
 namespace RangeFlag {
@@ -49,6 +51,34 @@ struct Range {
     gt = rv.gt;
     lt = rv.lt;
     limit = rv.limit;
+  }
+  using interval = boost::icl::interval<std::string>;
+  interval::type toInterval() const {
+    if(flags | RangeFlag::Gt) {
+      if(flags | RangeFlag::Lt) {
+        return interval::open(gt, lt);
+      } else if(flags | RangeFlag::Lte) {
+        return interval::left_open(gt, lt);
+      } else {
+        return interval::left_open(gt, "\xFF\xFF\xFF\xFF");
+      }
+    } else if(flags | RangeFlag::Gte) {
+      if(flags | RangeFlag::Lt) {
+        return interval::right_open(gt, lt);
+      } else if(flags | RangeFlag::Lte) {
+        return interval::closed(gt, lt);
+      } else {
+        return interval::closed(gt, "\xFF\xFF\xFF\xFF");
+      }
+    } else {
+      if(flags | RangeFlag::Lt) {
+        return interval::right_open("", lt);
+      } else if(flags | RangeFlag::Lte) {
+        return interval::closed("", lt);
+      } else {
+        return interval::closed("", "\xFF\xFF\xFF\xFF");
+      }
+    }
   }
 };
 

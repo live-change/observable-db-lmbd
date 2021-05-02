@@ -7,6 +7,7 @@
 
 #include <uWebSockets/Loop.h>
 #include <memory>
+#include "range.h"
 
 class Store;
 
@@ -22,30 +23,73 @@ public:
 };
 
 class ObjectObservation : public Observation, public std::enable_shared_from_this<ObjectObservation> {
+public:
+  using Callback = std::function<void (bool found, const std::string& value)>;
 private:
   std::shared_ptr<Store> store;
   std::string key;
   int id;
-  std::function<void (bool found, const std::string& value)> onState;
+  Callback onState;
   bool finished = false;
 public:
   ObjectObservation(std::shared_ptr<Store> storep, const std::string& keyp, int idp,
-                    std::function<void (bool found, const std::string& value)> onStatep);
+                    Callback onStatep);
   void handleUpdate(bool found, const std::string& value);
   virtual void close();
   virtual ~ObjectObservation();
 };
 
 class RangeObservation : public Observation {
+protected:
+  std::shared_ptr<Store> store;
+  Range range;
+  int id;
+  bool finished = false;
+public:
+  RangeObservation(std::shared_ptr<Store> storep, const Range& rangep, int idp);
 
+  virtual void handlePut(const std::string& key, const std::string& value);
+  virtual void handleDelete(const std::string& key);
+
+  virtual void close();
+  virtual ~RangeObservation();
 };
 
-class RangeDataObservation : public RangeObservation {
+class RangeDataObservation : public RangeObservation, public std::enable_shared_from_this<RangeDataObservation> {
+public:
+  using Callback = std::function<void (bool found, bool end, const std::string& key, const std::string& value)>;
+private:
+  Callback onValue;
+  std::function<void()> onChanges;
+  std::vector<std::string> keys;
+  bool changesMode = false;
+public:
 
+  RangeDataObservation(std::shared_ptr<Store> storep, const Range& rangep, int idp,
+                       Callback onValuep, std::function<void()> onChangesp);
+
+  virtual void handlePut(const std::string& key, const std::string& value);
+  virtual void handleDelete(const std::string& key);
+
+  /*virtual void close();
+  virtual ~RangeDataObservation();*/
 };
 
-class CountObservation : public RangeObservation {
+class CountObservation : public RangeObservation, public std::enable_shared_from_this<CountObservation> {
+public:
+  using Callback = std::function<void (int count)>();
+private:
+  Callback onState;
+  int count;
+public:
+  CountObservation(std::shared_ptr<Store> storep, const Range& rangep, int idp,
+      Callback onStatep);
 
+  virtual void handlePut(const std::string& key, const std::string& value);
+  virtual void handleDelete(const std::string& key);
+
+  /*virtual void close();
+  virtual ~CountObservation();*/
 };
 
 

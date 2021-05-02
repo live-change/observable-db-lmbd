@@ -15,6 +15,7 @@
 #include "taskQueue.h"
 #include "observation.h"
 #include "range.h"
+#include "WeakFastSet.h"
 
 class Database;
 
@@ -23,23 +24,12 @@ private:
   std::shared_ptr<Database> database;
 
   int lastObservationId = 0;
-
-
   using ObjectObservationSet = std::map<int, std::weak_ptr<ObjectObservation>>;
   std::unordered_map<std::string, ObjectObservationSet> objectObservations;
 
-  struct RangeObservationPointer {
-    const std::weak_ptr<RangeObservation> pointer;
-    bool operator==(const RangeObservationPointer& other) const {
-      return !pointer.owner_before(other.pointer) && !other.pointer.owner_before(pointer);
-    }
-    bool operator<(const RangeObservationPointer& other) const {
-      return pointer.owner_before(other.pointer);
-    }
-  };
-  using RangeObservationSet = std::set<RangeObservationPointer>;
-  boost::icl::interval_map<std::string, RangeObservationSet> rangeObservations;
-  RangeObservationSet allRangeObservations;
+  boost::icl::interval_map<std::string, std::set<int>> rangeObservations;
+  WeakFastSet<RangeObservation> allRangeObservations;
+
 
   std::string name;
   MDB_env* env;
@@ -82,7 +72,16 @@ public:
   void close() {
     std::lock_guard lock(stateMutex);
     finished = true;
-    /// TODO: kill observations
+    for(auto const& [key, observations] : objectObservations) {
+      for(auto const& [id, weak] : observations) {
+        std::shared_ptr<ObjectObservation> observation = weak.lock();
+        if(observation != nullptr) observation->close();
+      }
+    }
+    for(auto const& weak : allRangeObservations) {
+      std::shared_ptr<RangeObservation> observation = weak.lock();
+      if(observation != nullptr) observation->close();
+    }
     mdb_dbi_close(env, dbi);
   }
 
@@ -113,26 +112,42 @@ public:
     }
   }
 
-  std::shared_ptr<Observation> observeRange(RangeView rangeView,
-                                            std::function<void (const std::string& key, const std::string& value)> onResult,
+  std::shared_ptr<RangeDataObservation> observeRange(RangeView rangeView,
+                                            RangeDataObservation::Callback onResult,
                                             std::function<void()> onChanges) {
-    return nullptr;
+    std::lock_guard lock(stateMutex);
+    Range range(rangeView);
+    fprintf(stderr, "observe %x  '%s' - '%s'\n", range.flags, range.gt.c_str(), range.lt.c_str());
+    int id = allRangeObservations.findEmpty();
+    std::shared_ptr<RangeDataObservation> observation =
+        std::make_shared<RangeDataObservation>(shared_from_this(), range, id, onResult, onChanges);
+    allRangeObservations.buffer[id] = observation;
+    Range::interval::type interval = range.toInterval();
+    rangeObservations += std::make_pair(interval, std::set<int>({ id }));
+    return observation;
   }
 
-  std::shared_ptr<Observation> observeCount(RangeView rangeView,
+  void handleRangeObservationRemoved(const Range& range, int id) {
+    std::lock_guard lock(stateMutex);
+    Range::interval::type interval = range.toInterval();
+    rangeObservations -= std::make_pair(interval, std::set<int>({ id }));
+    allRangeObservations.remove(id);
+  }
+
+  std::shared_ptr<CountObservation> observeCount(RangeView rangeView,
                                             std::function<void(int)> onCount) {
     return nullptr;
   }
 
   void put(std::string_view keyp, std::string_view valuep,
-           std::function<void()> onOk) {
+           std::function<void(bool found, const std::string&)> onResult) {
     std::shared_ptr<Store> self = shared_from_this();
     uWS::Loop* loop = uWS::Loop::get();
     std::string key = std::string(keyp);
     std::string value = std::string(valuep);
-    taskQueue.enqueue([loop, self, this, key, value, onOk]() {
+    taskQueue.enqueue([loop, self, this, key, value, onResult]() {
       if(finished) {
-        loop->defer([onOk]() { onOk(); });
+        loop->defer([onResult]() { onResult(false, ""); });
         return;
       }
       int ret;
@@ -140,10 +155,14 @@ public:
       ret = mdb_txn_begin(env, nullptr, 0, &txn);
       MDB_val keyVal = { .mv_size = key.size(), .mv_data = (void*)key.data() };
       MDB_val valueVal = { .mv_size = value.size(), .mv_data = (void*)value.data() };
+
+      MDB_val oldValueVal;
+      int getRet = mdb_get(txn, dbi, &keyVal, &oldValueVal);
       ret = mdb_put(txn, dbi, &keyVal, &valueVal, 0);
       fprintf(stderr, "PUT RET %d %zd %zd\n", ret, keyVal.mv_size, valueVal.mv_size);
       mdb_txn_commit(txn);
       fprintf(stderr, "PUT %d %s = %s\n", dbi, key.c_str(), value.c_str());
+
       auto it = objectObservations.find(key);
       if(it != objectObservations.end()) {
         fprintf(stderr, "found observable\n");
@@ -152,37 +171,56 @@ public:
           observation->handleUpdate(true, value);
         }
       }
-      loop->defer([onOk]() {
-        onOk();
-      });
+
+      if(getRet == MDB_NOTFOUND) {
+        loop->defer([onResult]() {
+          onResult(false, "");
+        });
+      } else {
+        std::string oldValue((char*)oldValueVal.mv_data, oldValueVal.mv_size);
+        loop->defer([onResult, oldValue{std::move(oldValue)}]() {
+          onResult(true, oldValue);
+        });
+      }
     });
   }
   void del(std::string_view keyp,
-           std::function<void()> onOk) {
+           std::function<void(bool found, const std::string&)> onResult) {
     std::shared_ptr<Store> self = shared_from_this();
     uWS::Loop* loop = uWS::Loop::get();
     std::string key = std::string(keyp);
-    taskQueue.enqueue([loop, self, this, key, onOk]() {
+    taskQueue.enqueue([loop, self, this, key, onResult]() {
       if(finished) {
-        loop->defer([onOk]() { onOk(); });
+        loop->defer([onResult]() { onResult(false, ""); });
         return;
       }
       MDB_txn *txn;
       mdb_txn_begin(env, nullptr, 0, &txn);
       MDB_val keyVal = { .mv_size = key.size(), .mv_data = (void*)key.data() };
+      MDB_val valueVal;
+      int getRet = mdb_get(txn, dbi, &keyVal, &valueVal);
       /*int ret = */mdb_del(txn, dbi, &keyVal, 0);
       mdb_txn_commit(txn);
-      loop->defer([onOk]() {
-        onOk();
-      });
-    });
-    auto it = objectObservations.find(key);
-    if(it != objectObservations.end()) {
-      for(auto const& [id, weak]  : it->second) {
-        std::shared_ptr<ObjectObservation> observation = weak.lock();
-        observation->handleUpdate(false, "");
+
+      auto it = objectObservations.find(key);
+      if(it != objectObservations.end()) {
+        for(auto const& [id, weak]  : it->second) {
+          std::shared_ptr<ObjectObservation> observation = weak.lock();
+          observation->handleUpdate(false, "");
+        }
       }
-    }
+
+      if(getRet == MDB_NOTFOUND) {
+        loop->defer([onResult]() {
+          onResult(false, "");
+        });
+      } else {
+        std::string value((char*)valueVal.mv_data, valueVal.mv_size);
+        loop->defer([onResult, value{std::move(value)}]() {
+          onResult(true, value);
+        });
+      }
+    });
   }
   void get(std::string_view keyp,
            std::function<void(bool found, const std::string&)> callback) {
@@ -216,11 +254,16 @@ public:
     });
   }
   void getRange(RangeView rangeView,
+               std::function<void(const std::string& key, const std::string& value)> onValue,
+               std::function<void()> onEnd) {
+    Range range(rangeView);
+    getRange(range, onValue, onEnd);
+  }
+  void getRange(Range& range,
                 std::function<void(const std::string& key, const std::string& value)> onValue,
                 std::function<void()> onEnd) {
     std::shared_ptr<Store> self = shared_from_this();
     uWS::Loop* loop = uWS::Loop::get();
-    Range range(rangeView);
     taskQueue.enqueue([loop, self, this, range, onValue{std::move(onValue)}, onEnd]() {
       fprintf(stderr, "GET RANGE!\n");
       if(finished) {

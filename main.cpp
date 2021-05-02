@@ -158,6 +158,12 @@ private:
     ResultsDone = 89
   };
 
+  enum class ResultPutFlags {
+    Found = 0x1,
+    Last = 0x2,
+    First = 0x4
+  };
+
   std::function<void (char*, int)> sendCallback;
   std::function<void ()> closeCallback;
 public:
@@ -287,8 +293,8 @@ public:
         int valueSize = packet.readU32();
         char *valueData = packet.readPointer(valueSize);
         std::string_view value(valueData, valueSize);
-        store->put(key, value, [requestId, self](){
-          self->sendOk(requestId);
+        store->put(key, value, [this, requestId](bool found, const std::string& obj) {
+          sendResult(requestId, found, obj);
         });
       } break;
       case (uint8_t)OpCode::Delete: {
@@ -302,8 +308,8 @@ public:
         int keySize = packet.readU16();
         char* keyData = packet.readPointer(keySize);
         std::string_view key(keyData, keySize);
-        store->del(key, [requestId, self](){
-          self->sendOk(requestId);
+        store->del(key, [this, requestId](bool found, const std::string& obj) {
+          sendResult(requestId, found, obj);
         });
       } break;
       case (uint8_t)OpCode::DeleteRange: {
@@ -337,20 +343,7 @@ public:
         char* keyData = packet.readPointer(keySize);
         std::string_view key(keyData, keySize);
         store->get(key, [this, requestId](bool found, const std::string& obj) {
-          if(found) {
-            net::PacketBuffer resultPacket(obj.size() + 12);
-            resultPacket.writeU8((uint8_t) OpCode::Result);
-            resultPacket.writeU32(requestId);
-            resultPacket.writeBytes(obj.data(), obj.size());
-            resultPacket.flip();
-            sendCallback(resultPacket.getPointer(0), resultPacket.size());
-          } else {
-            net::PacketBuffer resultPacket(10);
-            resultPacket.writeU8((uint8_t) OpCode::ResultNotFound);
-            resultPacket.writeU32(requestId);
-            resultPacket.flip();
-            sendCallback(resultPacket.getPointer(0), resultPacket.size());
-          }
+          sendResult(requestId, found, obj);
         });
       } break;
       case (uint8_t)OpCode::GetRange: {
@@ -450,14 +443,18 @@ public:
         }
         RangeView range(packet);
         std::shared_ptr<Observation> observation =
-          store->observeRange(range, [requestId, this](std::string_view key, std::string_view value){
+          store->observeRange(range, [requestId, this](bool found, bool last, std::string_view key, std::string_view value){
             net::PacketBuffer resultPacket(key.size() + value.size() + 14);
             resultPacket.writeU8((uint8_t) OpCode::ResultPut);
             resultPacket.writeU32(requestId);
+            int flags = (found ? (int)ResultPutFlags::Found : 0) | (last ? (int)ResultPutFlags::Last : 0);
+            resultPacket.writeU8(flags);
             resultPacket.writeU16(key.size());
             resultPacket.writeBytes(key.data(), key.size());
-            resultPacket.writeU32(value.size());
-            resultPacket.writeBytes(value.data(), value.size());
+            if(found) {
+              resultPacket.writeU32(value.size());
+              resultPacket.writeBytes(value.data(), value.size());
+            }
             resultPacket.flip();
             sendCallback(resultPacket.getPointer(0), resultPacket.size());
           }, [requestId, this](){
@@ -504,6 +501,23 @@ public:
         observations.erase(it);
         observation->close();
       } break;
+    }
+  }
+
+  void sendResult(int requestId, bool found, const std::string& obj) {
+    if(found) {
+      net::PacketBuffer resultPacket(obj.size() + 12);
+      resultPacket.writeU8((uint8_t) OpCode::Result);
+      resultPacket.writeU32(requestId);
+      resultPacket.writeBytes(obj.data(), obj.size());
+      resultPacket.flip();
+      sendCallback(resultPacket.getPointer(0), resultPacket.size());
+    } else {
+      net::PacketBuffer resultPacket(10);
+      resultPacket.writeU8((uint8_t) OpCode::ResultNotFound);
+      resultPacket.writeU32(requestId);
+      resultPacket.flip();
+      sendCallback(resultPacket.getPointer(0), resultPacket.size());
     }
   }
   
