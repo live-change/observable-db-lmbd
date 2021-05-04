@@ -160,8 +160,8 @@ private:
 
   enum class ResultPutFlags {
     Found = 0x1,
-    Last = 0x2,
-    First = 0x4
+    Created = 0x2,
+    Last = 0x4
   };
 
   std::function<void (char*, int)> sendCallback;
@@ -443,11 +443,13 @@ public:
         }
         RangeView range(packet);
         std::shared_ptr<Observation> observation =
-          store->observeRange(range, [requestId, this](bool found, bool last, std::string_view key, std::string_view value){
+          store->observeRange(range, [requestId, this](bool found, bool created, bool last,
+              std::string_view key, std::string_view value){
             net::PacketBuffer resultPacket(key.size() + value.size() + 14);
             resultPacket.writeU8((uint8_t) OpCode::ResultPut);
             resultPacket.writeU32(requestId);
-            int flags = (found ? (int)ResultPutFlags::Found : 0) | (last ? (int)ResultPutFlags::Last : 0);
+            int flags = (found ? (int)ResultPutFlags::Found : 0) | (created ? (int)ResultPutFlags::Created : 0)
+                | (last ? (int)ResultPutFlags::Last : 0);
             resultPacket.writeU8(flags);
             resultPacket.writeU16(key.size());
             resultPacket.writeBytes(key.data(), key.size());
@@ -456,12 +458,16 @@ public:
               resultPacket.writeBytes(value.data(), value.size());
             }
             resultPacket.flip();
+            fprintf(stderr,"SEND RESULT PUT PACKET!\n");
+            resultPacket.print();
             sendCallback(resultPacket.getPointer(0), resultPacket.size());
           }, [requestId, this](){
             net::PacketBuffer resultPacket(12);
             resultPacket.writeU8((uint8_t)OpCode::ResultsChanges);
             resultPacket.writeU32(requestId);
             resultPacket.flip();
+            fprintf(stderr,"SEND RESULT CHANGES PACKET!\n");
+            resultPacket.print();
             sendCallback(resultPacket.getPointer(0), resultPacket.size());
           });
         observations[requestId] = observation;

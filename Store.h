@@ -11,6 +11,7 @@
 #include <lmdb.h>
 #include <uWebSockets/Loop.h>
 #include <boost/icl/interval_map.hpp>
+#include <iostream>
 
 #include "taskQueue.h"
 #include "observation.h"
@@ -117,12 +118,14 @@ public:
                                             std::function<void()> onChanges) {
     std::lock_guard lock(stateMutex);
     Range range(rangeView);
-    fprintf(stderr, "observe %x  '%s' - '%s'\n", range.flags, range.gt.c_str(), range.lt.c_str());
+    fprintf(stderr, "observe %d  '%s' - '%s' %d\n", range.flags, range.gt.c_str(), range.lt.c_str(), range.limit);
     int id = allRangeObservations.findEmpty();
     std::shared_ptr<RangeDataObservation> observation =
         std::make_shared<RangeDataObservation>(shared_from_this(), range, id, onResult, onChanges);
+    observation->init();
     allRangeObservations.buffer[id] = observation;
     Range::interval::type interval = range.toInterval();
+    std::cout << "interval:" << interval << "\n";
     rangeObservations += std::make_pair(interval, std::set<int>({ id }));
     return observation;
   }
@@ -137,6 +140,26 @@ public:
   std::shared_ptr<CountObservation> observeCount(RangeView rangeView,
                                             std::function<void(int)> onCount) {
     return nullptr;
+  }
+
+  void notifyObservers(bool found, bool created, const std::string& key, const std::string& value) {
+    fprintf(stderr, "NOTIFY OBSERVERS! %d %d '%s' '%s'\n", found, created, key.c_str(), value.c_str());
+    auto objectIt = objectObservations.find(key);
+    if(objectIt != objectObservations.end()) {
+      for(auto const& [id, weak]  : objectIt->second) {
+        std::shared_ptr<ObjectObservation> observation = weak.lock();
+        observation->handleUpdate(found, value);
+      }
+    }
+
+    auto rangeIt = rangeObservations.find(key);
+    if (rangeIt != rangeObservations.end()) {
+      fprintf(stderr, "found range observations\n");
+      for (int id : rangeIt->second) {
+        std::shared_ptr<RangeObservation> observation = allRangeObservations.buffer[id].lock();
+        observation->handleOperation(found, created, key, value);
+      }
+    }
   }
 
   void put(std::string_view keyp, std::string_view valuep,
@@ -163,14 +186,7 @@ public:
       mdb_txn_commit(txn);
       fprintf(stderr, "PUT %d %s = %s\n", dbi, key.c_str(), value.c_str());
 
-      auto it = objectObservations.find(key);
-      if(it != objectObservations.end()) {
-        fprintf(stderr, "found observable\n");
-        for(auto const& [id, weak]  : it->second) {
-          std::shared_ptr<ObjectObservation> observation = weak.lock();
-          observation->handleUpdate(true, value);
-        }
-      }
+      notifyObservers(true, getRet == MDB_NOTFOUND, key, value);
 
       if(getRet == MDB_NOTFOUND) {
         loop->defer([onResult]() {
@@ -202,12 +218,8 @@ public:
       /*int ret = */mdb_del(txn, dbi, &keyVal, 0);
       mdb_txn_commit(txn);
 
-      auto it = objectObservations.find(key);
-      if(it != objectObservations.end()) {
-        for(auto const& [id, weak]  : it->second) {
-          std::shared_ptr<ObjectObservation> observation = weak.lock();
-          observation->handleUpdate(false, "");
-        }
+      if(getRet != MDB_NOTFOUND) {
+        notifyObservers(false, false, key, "");
       }
 
       if(getRet == MDB_NOTFOUND) {
@@ -476,6 +488,7 @@ public:
           if((range.flags & RangeFlag::Gte) && keyView < range.gt) break;
           if( (!(range.flags & RangeFlag::Lt) || keyView < range.lt)
               && (!(range.flags & RangeFlag::Lte) || keyView <= range.lt) ) {
+            notifyObservers(false, false, std::string(keyView), "");
             mdb_cursor_del(cursor, 0);
             readCount++;
           }
@@ -500,6 +513,7 @@ public:
           if((range.flags & RangeFlag::Lte) && keyView > range.lt) break;
           if( (!(range.flags & RangeFlag::Gt) || keyView > range.gt)
               && (!(range.flags & RangeFlag::Gte) || keyView >= range.gt) ) {
+            notifyObservers(false, false, std::string(keyView), "");
             mdb_cursor_del(cursor, 0);
             readCount++;
           }

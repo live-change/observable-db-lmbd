@@ -45,11 +45,12 @@ protected:
   Range range;
   int id;
   bool finished = false;
+  bool waitingForRead = true;
+  friend class RangeDataObservation;
 public:
   RangeObservation(std::shared_ptr<Store> storep, const Range& rangep, int idp);
 
-  virtual void handlePut(const std::string& key, const std::string& value);
-  virtual void handleDelete(const std::string& key);
+  virtual void handleOperation(bool found, bool created, const std::string& key, const std::string& value);
 
   virtual void close();
   virtual ~RangeObservation();
@@ -57,19 +58,22 @@ public:
 
 class RangeDataObservation : public RangeObservation, public std::enable_shared_from_this<RangeDataObservation> {
 public:
-  using Callback = std::function<void (bool found, bool end, const std::string& key, const std::string& value)>;
+  using Callback = std::function<void (bool found, bool created, bool end, const std::string& key,
+      const std::string& value)>;
 private:
   Callback onValue;
   std::function<void()> onChanges;
   std::vector<std::string> keys;
-  bool changesMode = false;
+  std::vector<std::tuple<bool, bool, std::string, std::string>> waitingOperations;
 public:
 
   RangeDataObservation(std::shared_ptr<Store> storep, const Range& rangep, int idp,
                        Callback onValuep, std::function<void()> onChangesp);
 
-  virtual void handlePut(const std::string& key, const std::string& value);
-  virtual void handleDelete(const std::string& key);
+  void init();
+
+  virtual void handleOperation(bool found, bool created, const std::string& key, const std::string& value);
+  void processOperation(bool found, bool created, const std::string& key, const std::string& value);
 
   /*virtual void close();
   virtual ~RangeDataObservation();*/
@@ -85,8 +89,7 @@ public:
   CountObservation(std::shared_ptr<Store> storep, const Range& rangep, int idp,
       Callback onStatep);
 
-  virtual void handlePut(const std::string& key, const std::string& value);
-  virtual void handleDelete(const std::string& key);
+  virtual void handleOperation(bool found, bool created, const std::string& key, const std::string& value);
 
   /*virtual void close();
   virtual ~CountObservation();*/
