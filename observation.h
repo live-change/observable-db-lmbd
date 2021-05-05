@@ -45,7 +45,6 @@ protected:
   Range range;
   int id;
   bool finished = false;
-  bool waitingForRead = true;
   friend class RangeDataObservation;
 public:
   RangeObservation(std::shared_ptr<Store> storep, const Range& rangep, int idp);
@@ -65,6 +64,7 @@ private:
   std::function<void()> onChanges;
   std::vector<std::string> keys;
   std::vector<std::tuple<bool, bool, std::string, std::string>> waitingOperations;
+  bool waitingForRead = true;
 public:
 
   RangeDataObservation(std::shared_ptr<Store> storep, const Range& rangep, int idp,
@@ -79,17 +79,27 @@ public:
   virtual ~RangeDataObservation();*/
 };
 
-class CountObservation : public RangeObservation, public std::enable_shared_from_this<CountObservation> {
+class RangeCountObservation : public RangeObservation, public std::enable_shared_from_this<RangeCountObservation> {
 public:
-  using Callback = std::function<void (int count)>();
+  using Callback = std::function<void (int count)>;
 private:
-  Callback onState;
-  int count;
+  Callback onCount;
+  int count = 0;
+  int waitingDiff = 0;
+  bool needRecount = false;
+  bool waitingForRead = false;
+  bool lastKeyLimit = false;
+  bool firstCount = true;
+  std::string lastKey;
 public:
-  CountObservation(std::shared_ptr<Store> storep, const Range& rangep, int idp,
-      Callback onStatep);
+  RangeCountObservation(std::shared_ptr<Store> storep, const Range& rangep, int idp,
+      Callback onCountp);
+
+  void init();
+  void recount();
 
   virtual void handleOperation(bool found, bool created, const std::string& key, const std::string& value);
+  void processOperation(bool found, bool created, const std::string& key, const std::string& value);
 
   /*virtual void close();
   virtual ~CountObservation();*/

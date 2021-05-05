@@ -118,8 +118,9 @@ public:
                                             std::function<void()> onChanges) {
     std::lock_guard lock(stateMutex);
     Range range(rangeView);
-    fprintf(stderr, "observe %d  '%s' - '%s' %d\n", range.flags, range.gt.c_str(), range.lt.c_str(), range.limit);
     int id = allRangeObservations.findEmpty();
+    fprintf(stderr, "observe data %d  '%s' - '%s' %d id:%d\n",
+            range.flags, range.gt.c_str(), range.lt.c_str(), range.limit, id);
     std::shared_ptr<RangeDataObservation> observation =
         std::make_shared<RangeDataObservation>(shared_from_this(), range, id, onResult, onChanges);
     observation->init();
@@ -131,15 +132,30 @@ public:
   }
 
   void handleRangeObservationRemoved(const Range& range, int id) {
+    fprintf(stderr,"RANGE OBSERVATION REMOVED %d\n", id);
     std::lock_guard lock(stateMutex);
     Range::interval::type interval = range.toInterval();
     rangeObservations -= std::make_pair(interval, std::set<int>({ id }));
     allRangeObservations.remove(id);
   }
 
-  std::shared_ptr<CountObservation> observeCount(RangeView rangeView,
-                                            std::function<void(int)> onCount) {
-    return nullptr;
+  std::shared_ptr<RangeCountObservation> observeCount(RangeView rangeView,
+                                            RangeCountObservation::Callback onCount) {
+    std::lock_guard lock(stateMutex);
+    Range range(rangeView);
+    int id = allRangeObservations.findEmpty();
+    fprintf(stderr, "observe count %d  '%s' - '%s' %d id:%d\n",
+            range.flags, range.gt.c_str(), range.lt.c_str(), range.limit, id);
+    std::shared_ptr<RangeCountObservation> observation =
+        std::make_shared<RangeCountObservation>(shared_from_this(), range, id, onCount);
+    observation->init();
+    fprintf(stderr, "observation initiated!\n");
+    allRangeObservations.buffer[id] = observation;
+    Range::interval::type interval = range.toInterval();
+    std::cout << "interval:" << interval << "\n";
+    rangeObservations += std::make_pair(interval, std::set<int>({ id }));
+    fprintf(stderr, "interval set!\n");
+    return observation;
   }
 
   void notifyObservers(bool found, bool created, const std::string& key, const std::string& value) {
@@ -151,7 +167,6 @@ public:
         observation->handleUpdate(found, value);
       }
     }
-
     auto rangeIt = rangeObservations.find(key);
     if (rangeIt != rangeObservations.end()) {
       fprintf(stderr, "found range observations\n");
@@ -361,9 +376,14 @@ public:
 
   void getCount(RangeView rangeView,
                 std::function<void(int, const std::string&)> onCount) {
+    Range range(rangeView);
+    getCount(range, onCount);
+  }
+
+  void getCount(Range& range,
+                std::function<void(int, const std::string&)> onCount) {
     std::shared_ptr<Store> self = shared_from_this();
     uWS::Loop* loop = uWS::Loop::get();
-    Range range(rangeView);
     taskQueue.enqueue([loop, self, this, range, onCount{std::move(onCount)}]() {
       fprintf(stderr, "GET RANGE!\n");
       if(finished) {

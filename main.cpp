@@ -494,6 +494,7 @@ public:
             resultPacket.flip();
             sendCallback(resultPacket.getPointer(0), resultPacket.size());
           });
+        observations[requestId] = observation;
       } break;
 
       case (uint8_t)OpCode::Unobserve: {
@@ -586,9 +587,6 @@ int main(int argc, char** argv) {
         PerSocketData* socketData = (PerSocketData*)ws->getUserData();
         socketData->connection = std::make_shared<ClientConnection>();
         socketData->connection->handleOpen([ws](char* data, int size) {
-          if(data[0] == 0x1e) {
-            fprintf(stderr, "WTF?!\n");
-          }
           ws->send(std::string_view(data, size), uWS::OpCode::BINARY);
         }, [ws]() {
           ws->close();

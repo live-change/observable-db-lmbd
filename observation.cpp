@@ -36,6 +36,7 @@ RangeObservation::RangeObservation(std::shared_ptr<Store> storep, const Range& r
   : store(storep), range(rangep), id(idp) {}
 void RangeObservation::close() {
   finished = true;
+  store->handleRangeObservationRemoved(range, id);
 }
 void RangeObservation::handleOperation(bool found, bool created, const std::string& key, const std::string& value) {}
 RangeObservation::~RangeObservation() {
@@ -180,10 +181,108 @@ void RangeDataObservation::processOperation(bool found, bool created,
   }
 }
 
-CountObservation::CountObservation(std::shared_ptr<Store> storep, const Range& rangep, int idp, Callback onStatep)
- : RangeObservation(storep, rangep, idp) {
-
+RangeCountObservation::RangeCountObservation(std::shared_ptr<Store> storep, const Range& rangep, int idp,
+                                             Callback onCountp)
+ : RangeObservation(storep, rangep, idp), onCount(onCountp) {
 }
-void CountObservation::handleOperation(bool found, bool created, const std::string& key, const std::string& value) {
+void RangeCountObservation::init() {
+  recount();
+}
+void RangeCountObservation::recount() {
+  waitingForRead = true;
+  needRecount = false;
+  std::shared_ptr<RangeCountObservation> self = shared_from_this();
+  store->getCount(range, [self](int cnt, const std::string& last) {
+    if(self->finished) return;
+    fprintf(stderr, "GET COUNT RESULT %d FIRST COUNT %d\n", cnt, self->firstCount);
+    if((self->range.flags & RangeFlag::Limit) && cnt == self->range.limit) {
+      self->lastKey = last;
+      self->lastKeyLimit = true;
+    }
+    if(self->needRecount) {
+      fprintf(stderr, "NEED RECOUNT!\n");
+      if(self->firstCount || cnt != self->count) {
+        self->firstCount = false;
+        self->count = cnt;
+        self->onCount(self->count);
+      }
+      self->recount();
+    } else {
+      self->waitingForRead = false;
+      int newCount = cnt + self->waitingDiff;
+      self->waitingDiff = 0;
+      if((self->range.flags & RangeFlag::Limit) && self->count > self->range.limit) {
+        self->count = self->range.limit;
+      }
+      if(self->firstCount || newCount != self->count) {
+        self->firstCount = false;
+        self->count = newCount;
+        self->onCount(self->count);
+      }
+    }
+  });
+}
 
+void RangeCountObservation::handleOperation(bool found, bool created, const std::string& key, const std::string& value) {
+  fprintf(stderr, "COUNT HANDLE OPERATION %d %d %s", found, created, key.c_str());
+  std::shared_ptr<RangeCountObservation> self = shared_from_this();
+  loop->defer([self, found, created, key{std::move(key)}, value{std::move(value)}](){
+    self->processOperation(found, created, key, value);
+  });
+}
+void RangeCountObservation::processOperation(bool found, bool created, const std::string& key, const std::string& value) {
+  fprintf(stderr, "COUNT PROCESS OPERATION %d %d %s", found, created, key.c_str());
+  if(finished) return;
+  if(found && !created) return; // ignore value updates
+  if((range.flags & RangeFlag::Gt) && !(key > range.gt)) throw std::runtime_error("key not in range");
+  if((range.flags & RangeFlag::Lt) && !(key < range.lt)) throw std::runtime_error("key not in range");
+  if((range.flags & RangeFlag::Gte) && !(key >= range.gt)) throw std::runtime_error("key not in range");
+  if((range.flags & RangeFlag::Lte) && !(key <= range.lt)) throw std::runtime_error("key not in range");
+  if(range.flags & RangeFlag::Limit) {
+    if(lastKeyLimit && (
+        ((range.flags & RangeFlag::Reverse) && key<lastKey)
+        || (!(range.flags & RangeFlag::Reverse) && key>lastKey)
+        )) {
+      return; /// ignore keys outside limited range
+    }
+    if(waitingForRead) {
+      if (found) {
+        waitingDiff ++;
+      } else {
+        needRecount = true;
+      }
+    } else {
+      if(found) {
+        if(count < range.limit) {
+          count ++;
+          onCount(count);
+        }
+      } else {
+        if(count < range.limit) {
+          count --;
+          onCount(count);
+        } else {
+          recount();
+        }
+      }
+    }
+  } else {
+    if(waitingForRead) {
+      if(found) {
+        waitingDiff ++;
+      } else {
+        waitingDiff --;
+      }
+    } else {
+      if(found) {
+        if(created) {
+          count ++;
+          onCount(count);
+        }
+      } else {
+        count --;
+        onCount(count);
+      }
+    }
+  }
 }
