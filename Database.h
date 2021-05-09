@@ -54,10 +54,10 @@ public:
         }
         return;
       }
-      fprintf(stderr, "OPEN OPEN STORE %s\n", storeName.c_str());
+      db_log("OPEN OPEN STORE %s", storeName.c_str());
       store = std::make_shared<Store>(self, storeName, env);
       int ret = store->open();
-      fprintf(stderr, "OPEN OPEN STORE %s RET = %d\n", storeName.c_str(), ret);
+      db_log("OPEN OPEN STORE %s RET = %d", storeName.c_str(), ret);
       if(ret == 0) {
         stores[storeName] = store;
         loop->defer([callback, store]() {
@@ -90,7 +90,7 @@ public:
         return;
       }
       std::shared_ptr<Store> store = std::make_shared<Store>(self, name, env);
-      fprintf(stderr, "CREATE STORE %s\n", name.c_str());
+      db_log("CREATE STORE %s", name.c_str());
       int ret = store->create();
       if(ret == 0) {
         stores[name] = store;
@@ -98,7 +98,7 @@ public:
           onOk();
         });
       } else {
-        fprintf(stderr, "MDB CREATE RET %d\n", ret);
+        db_log("MDB CREATE RET %d", ret);
         if(ret == MDB_BAD_VALSIZE) {
           loop->defer([onError]() {
             onError("max_bad_valsize");
@@ -124,9 +124,11 @@ public:
       }
       if(store == nullptr) {
         store = std::make_shared<Store>(self, name, env);
-        if(!store->open()) {
+        int ret = store->open();
+        if(ret != 0) {
+          db_log("MDB OPEN %s RET %d", name.c_str(), ret);
           loop->defer([onError, store]() {
-            onError("not_found");
+            onError("store_not_found");
           });
           return;
         }
@@ -144,11 +146,15 @@ public:
   void close() {
     std::lock_guard lock(stateMutex);
     finished = true;
+    db_log("closing database stores!");
     for(auto const& [key, val] : stores) {
       std::shared_ptr<Store> store = val.lock();
-      store->close();
+      db_log("closing store %s", key.c_str());
+      if(store != nullptr) store->close();
     }
+    db_log("syncing database!");
     mdb_env_sync(env, 1);
+    db_log("closing database handle!");
     mdb_env_close(env);
   }
 

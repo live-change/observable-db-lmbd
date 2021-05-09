@@ -7,6 +7,8 @@
 #include <cstring>
 #include <stdexcept>
 
+#include "log.h"
+
 // TODO: determine endianess in cmake
 #define REVERSE_ENDIAN 1
 
@@ -536,7 +538,7 @@ namespace net {
 
   void PacketBuffer::print() {
     for(unsigned int i = 0; i < byteSize; i++) {
-      fprintf(stderr, "B %d = %d = %x\n",i,(unsigned char)buffer[i],(unsigned char)buffer[i]);
+      db_log("B %d = %d = %x",i,(unsigned char)buffer[i],(unsigned char)buffer[i]);
     }
   }
 

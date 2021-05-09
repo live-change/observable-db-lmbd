@@ -53,6 +53,9 @@ public:
 
   virtual void close();
   virtual ~RangeObservation();
+  Range getRange() {
+    return range;
+  }
 };
 
 class RangeDataObservation : public RangeObservation, public std::enable_shared_from_this<RangeDataObservation> {

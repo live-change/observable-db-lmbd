@@ -13,6 +13,7 @@
 #include <boost/icl/interval_map.hpp>
 #include <iostream>
 
+#include "log.h"
 #include "taskQueue.h"
 #include "observation.h"
 #include "range.h"
@@ -31,11 +32,10 @@ private:
   boost::icl::interval_map<std::string, std::set<int>> rangeObservations;
   WeakFastSet<RangeObservation> allRangeObservations;
 
-
   std::string name;
   MDB_env* env;
   MDB_dbi dbi;
-  std::mutex stateMutex;
+  std::recursive_mutex stateMutex;
   bool finished = false;
   friend class Database;
 public:
@@ -46,7 +46,7 @@ public:
   }
 
   ~Store() {
-    fprintf(stderr, "STORE DESTROYED! %s\n", name.c_str());
+    db_log("STORE DESTROYED! %s", name.c_str());
     close();
   }
 
@@ -56,7 +56,7 @@ public:
     mdb_txn_begin(env, nullptr, 0, &txn);
     int ret = mdb_dbi_open(txn, name.c_str(), MDB_CREATE, &dbi);
     mdb_txn_commit(txn);
-    fprintf(stderr, "CREATE %s RET %d\n", name.c_str(), ret);
+    db_log("CREATE %s RET %d", name.c_str(), ret);
     return ret;
   }
 
@@ -66,22 +66,27 @@ public:
     mdb_txn_begin(env, nullptr, 0, &txn);
     int ret = mdb_dbi_open(txn, name.c_str(), 0, &dbi);
     mdb_txn_commit(txn);
-    fprintf(stderr, "OPEN %s RET %d\n", name.c_str(), ret);
+    db_log("OPEN %s RET %d", name.c_str(), ret);
     return ret;
   }
 
   void close() {
     std::lock_guard lock(stateMutex);
+    if(finished) return;
     finished = true;
     for(auto const& [key, observations] : objectObservations) {
       for(auto const& [id, weak] : observations) {
         std::shared_ptr<ObjectObservation> observation = weak.lock();
+        db_log("cloo[");
         if(observation != nullptr) observation->close();
+        db_log("]cloo");
       }
     }
     for(auto const& weak : allRangeObservations) {
       std::shared_ptr<RangeObservation> observation = weak.lock();
+      db_log("clro[");
       if(observation != nullptr) observation->close();
+      db_log("]clro");
     }
     mdb_dbi_close(env, dbi);
   }
@@ -98,7 +103,7 @@ public:
     std::lock_guard lock(stateMutex);
     int id = ++lastObservationId;
     std::string key(keyp);
-    fprintf(stderr, "observe %s\n", key.c_str());
+    db_log("observe %s", key.c_str());
     std::shared_ptr<ObjectObservation> observation =
         std::make_shared<ObjectObservation>(shared_from_this(), key, id, onState);
     auto emplaced = objectObservations.try_emplace(key);
@@ -119,20 +124,20 @@ public:
     std::lock_guard lock(stateMutex);
     Range range(rangeView);
     int id = allRangeObservations.findEmpty();
-    fprintf(stderr, "observe data %d  '%s' - '%s' %d id:%d\n",
+    db_log("observe data %d  '%s' - '%s' %d id:%d",
             range.flags, range.gt.c_str(), range.lt.c_str(), range.limit, id);
     std::shared_ptr<RangeDataObservation> observation =
         std::make_shared<RangeDataObservation>(shared_from_this(), range, id, onResult, onChanges);
     observation->init();
     allRangeObservations.buffer[id] = observation;
     Range::interval::type interval = range.toInterval();
-    std::cout << "interval:" << interval << "\n";
+    //std::cout << "interval:" << interval << "\n";
     rangeObservations += std::make_pair(interval, std::set<int>({ id }));
     return observation;
   }
 
   void handleRangeObservationRemoved(const Range& range, int id) {
-    fprintf(stderr,"RANGE OBSERVATION REMOVED %d\n", id);
+    db_log("RANGE OBSERVATION REMOVED %d", id);
     std::lock_guard lock(stateMutex);
     Range::interval::type interval = range.toInterval();
     rangeObservations -= std::make_pair(interval, std::set<int>({ id }));
@@ -144,35 +149,42 @@ public:
     std::lock_guard lock(stateMutex);
     Range range(rangeView);
     int id = allRangeObservations.findEmpty();
-    fprintf(stderr, "observe count %d  '%s' - '%s' %d id:%d\n",
+    db_log("observe count %d  '%s' - '%s' %d id:%d",
             range.flags, range.gt.c_str(), range.lt.c_str(), range.limit, id);
     std::shared_ptr<RangeCountObservation> observation =
         std::make_shared<RangeCountObservation>(shared_from_this(), range, id, onCount);
     observation->init();
-    fprintf(stderr, "observation initiated!\n");
+    db_log("observation initiated!");
     allRangeObservations.buffer[id] = observation;
     Range::interval::type interval = range.toInterval();
-    std::cout << "interval:" << interval << "\n";
+    //std::cout << "interval:" << interval << "\n";
     rangeObservations += std::make_pair(interval, std::set<int>({ id }));
-    fprintf(stderr, "interval set!\n");
+    db_log("interval set!");
     return observation;
   }
 
   void notifyObservers(bool found, bool created, const std::string& key, const std::string& value) {
-    fprintf(stderr, "NOTIFY OBSERVERS! %d %d '%s' '%s'\n", found, created, key.c_str(), value.c_str());
+    db_log("NOTIFY OBSERVERS! %d %d '%s' '%s'", found, created, key.c_str(), value.c_str());
+    std::lock_guard lock(stateMutex);
     auto objectIt = objectObservations.find(key);
     if(objectIt != objectObservations.end()) {
       for(auto const& [id, weak]  : objectIt->second) {
         std::shared_ptr<ObjectObservation> observation = weak.lock();
-        observation->handleUpdate(found, value);
+        if(observation != nullptr) observation->handleUpdate(found, value);
       }
     }
     auto rangeIt = rangeObservations.find(key);
     if (rangeIt != rangeObservations.end()) {
-      fprintf(stderr, "found range observations\n");
-      for (int id : rangeIt->second) {
+      db_log("found range observations");
+      auto observations = rangeIt->second;
+      for (int id : observations) {
         std::shared_ptr<RangeObservation> observation = allRangeObservations.buffer[id].lock();
-        observation->handleOperation(found, created, key, value);
+        if(observation != nullptr) {
+          auto range = observation->getRange();
+          db_log("range observation %d %s - %s limit: %d id: %d",
+                  range.flags, range.gt.c_str(), range.lt.c_str(), range.limit, id);
+          observation->handleOperation(found, created, key, value);
+        }
       }
     }
   }
@@ -183,7 +195,7 @@ public:
     uWS::Loop* loop = uWS::Loop::get();
     std::string key = std::string(keyp);
     std::string value = std::string(valuep);
-    taskQueue.enqueue([loop, self, this, key, value, onResult]() {
+    writeQueue.enqueue([loop, self, this, key, value, onResult]() {
       if(finished) {
         loop->defer([onResult]() { onResult(false, ""); });
         return;
@@ -194,12 +206,14 @@ public:
       MDB_val keyVal = { .mv_size = key.size(), .mv_data = (void*)key.data() };
       MDB_val valueVal = { .mv_size = value.size(), .mv_data = (void*)value.data() };
 
+      db_log("PUT %d %s = %s", dbi, key.c_str(), value.c_str());
       MDB_val oldValueVal;
       int getRet = mdb_get(txn, dbi, &keyVal, &oldValueVal);
+      db_log("GET RET %d %zd %zd", getRet, keyVal.mv_size, oldValueVal.mv_size);
       ret = mdb_put(txn, dbi, &keyVal, &valueVal, 0);
-      fprintf(stderr, "PUT RET %d %zd %zd\n", ret, keyVal.mv_size, valueVal.mv_size);
+      db_log("PUT RET %d %zd %zd", ret, keyVal.mv_size, valueVal.mv_size);
       mdb_txn_commit(txn);
-      fprintf(stderr, "PUT %d %s = %s\n", dbi, key.c_str(), value.c_str());
+
 
       notifyObservers(true, getRet == MDB_NOTFOUND, key, value);
 
@@ -220,7 +234,7 @@ public:
     std::shared_ptr<Store> self = shared_from_this();
     uWS::Loop* loop = uWS::Loop::get();
     std::string key = std::string(keyp);
-    taskQueue.enqueue([loop, self, this, key, onResult]() {
+    writeQueue.enqueue([loop, self, this, key, onResult]() {
       if(finished) {
         loop->defer([onResult]() { onResult(false, ""); });
         return;
@@ -256,7 +270,7 @@ public:
     std::string key = std::string(keyp);
     taskQueue.enqueue([loop, self, this, key, callback]() {
       if(finished) {
-        fprintf(stderr, "GET WHEN FINISHED!!!\n");
+        db_log("GET WHEN FINISHED!!!");
         loop->defer([callback]() { callback(false, ""); });
         return;
       }
@@ -265,7 +279,7 @@ public:
       MDB_val keyVal = { .mv_size = key.size(), .mv_data = (void*)key.data() };
       MDB_val valueVal;
       int ret = mdb_get(txn, dbi, &keyVal, &valueVal);
-      fprintf(stderr, "GET RET %d %zd %zd\n", ret, keyVal.mv_size, valueVal.mv_size);
+      db_log("GET RET %d %zd %zd", ret, keyVal.mv_size, valueVal.mv_size);
       mdb_txn_abort(txn);
       if(ret == MDB_NOTFOUND) {
         loop->defer([callback]() {
@@ -273,7 +287,7 @@ public:
         });
       } else {
         std::string value((const char*)valueVal.mv_data, valueVal.mv_size);
-        fprintf(stderr, "GET %d %s = %s\n", dbi, key.c_str(), value.c_str());
+        db_log("GET %d %s = %s", dbi, key.c_str(), value.c_str());
         loop->defer([callback, value]() {
           callback(true, value);
         });
@@ -292,9 +306,9 @@ public:
     std::shared_ptr<Store> self = shared_from_this();
     uWS::Loop* loop = uWS::Loop::get();
     taskQueue.enqueue([loop, self, this, range, onValue{std::move(onValue)}, onEnd]() {
-      fprintf(stderr, "GET RANGE!\n");
+      //db_log("GET RANGE!);
       if(finished) {
-        fprintf(stderr, "GET RANGE WHEN FINISHED!\n");
+        //db_log("GET RANGE WHEN FINISHED!);
         loop->defer([onEnd]() { onEnd(); });
         return;
       }
@@ -305,7 +319,7 @@ public:
 
       int readCount = 0;
       bool isLimited = range.flags & RangeFlag::Limit;
-      fprintf(stderr,"IS LIMITED %d\n", isLimited);
+      //db_log("IS LIMITED %d, isLimited);
       int ret;
       MDB_val keyVal, valueVal;
 
@@ -314,17 +328,17 @@ public:
           keyVal.mv_size = range.lt.size();
           keyVal.mv_data = (void*)range.lt.data();
           ret = mdb_cursor_get(cursor, &keyVal, &valueVal, MDB_SET_RANGE);
-          fprintf(stderr, "SET_RANGE RET %d\n", ret);
-          fprintf(stderr, "KEY AFTER SET_RANGE %s = %s\n", range.lt.c_str(),
-                  std::string((const char*)keyVal.mv_data, keyVal.mv_size).c_str());
+          /*db_log("SET_RANGE RET %d, ret);
+          db_log("KEY AFTER SET_RANGE %s = %s, range.lt.c_str(),
+                  std::string((const char*)keyVal.mv_data, keyVal.mv_size).c_str());*/
           if(ret == MDB_NOTFOUND) {
             ret = mdb_cursor_get(cursor, &keyVal, &valueVal, MDB_LAST);
-            fprintf(stderr, "LAST RET %d\n", ret);
-            fprintf(stderr, "KEY AFTER LAST %s = %s\n", range.lt.c_str(),
-                    std::string((const char*)keyVal.mv_data, keyVal.mv_size).c_str());
+            /*db_log("LAST RET %d, ret);
+            db_log("KEY AFTER LAST %s = %s, range.lt.c_str(),
+                    std::string((const char*)keyVal.mv_data, keyVal.mv_size).c_str());*/
           }
         } else {
-          mdb_cursor_get(cursor, &keyVal, &valueVal, MDB_LAST);
+          ret = mdb_cursor_get(cursor, &keyVal, &valueVal, MDB_LAST);
         }
         while((!isLimited || readCount < range.limit) && ret != MDB_NOTFOUND) {
           std::string_view keyView((char*)keyVal.mv_data, keyVal.mv_size);
@@ -332,42 +346,50 @@ public:
           if((range.flags & RangeFlag::Gte) && keyView < range.gt) break;
           if( (!(range.flags & RangeFlag::Lt) || keyView < range.lt)
               && (!(range.flags & RangeFlag::Lte) || keyView <= range.lt) ) {
-            onValue(std::string(keyView), std::string((char*)valueVal.mv_data, valueVal.mv_size));
+            std::string key(keyView);
+            std::string value(std::string((char*)valueVal.mv_data, valueVal.mv_size));
+            loop->defer([onValue, key{std::move(key)}, value{std::move(value)}]() {
+              onValue(key, value);
+            });
             readCount++;
           }
           ret =  mdb_cursor_get(cursor, &keyVal, &valueVal, MDB_PREV);
-          fprintf(stderr, "RET %d KEY AFTER NEXT %s = %s\n", ret,
+          /*db_log("RET %d KEY AFTER NEXT %s = %s, ret,
                   keyVal.mv_size > 0 ? std::string((const char*)keyVal.mv_data, keyVal.mv_size).c_str() : "",
-                  valueVal.mv_size > 0 ? std::string((const char*)valueVal.mv_data, valueVal.mv_size).c_str() : "");
+                  valueVal.mv_size > 0 ? std::string((const char*)valueVal.mv_data, valueVal.mv_size).c_str() : "");*/
         }
       } else {
         if(range.flags & (RangeFlag::Gt | RangeFlag::Gte)) {
           keyVal.mv_size = range.gt.size();
           keyVal.mv_data = (void*)range.gt.data();
           ret = mdb_cursor_get(cursor, &keyVal, &valueVal, MDB_SET_RANGE);
-          fprintf(stderr, "SET_RANGE RET %d\n", ret);
-          fprintf(stderr, "KEY AFTER SET_RANGE %s = %s\n", range.gt.c_str(),
-                  std::string((const char*)keyVal.mv_data, keyVal.mv_size).c_str());
+          /*db_log("SET_RANGE RET %d, ret);
+          db_log("KEY AFTER SET_RANGE %s = %s, range.gt.c_str(),
+                  std::string((const char*)keyVal.mv_data, keyVal.mv_size).c_str());*/
         } else {
-          mdb_cursor_get(cursor, &keyVal, &valueVal, MDB_FIRST);
+          ret = mdb_cursor_get(cursor, &keyVal, &valueVal, MDB_FIRST);
         }
         while((!isLimited || readCount < range.limit) && ret != MDB_NOTFOUND) {
-          fprintf(stderr, "RC %d < %d\n", readCount, range.limit);
+          //db_log("RC %d < %d, readCount, range.limit);
           std::string_view keyView((char*)keyVal.mv_data, keyVal.mv_size);
           if((range.flags & RangeFlag::Lt) && keyView >= range.lt) break;
           if((range.flags & RangeFlag::Lte) && keyView > range.lt) break;
           if( (!(range.flags & RangeFlag::Gt) || keyView > range.gt)
               && (!(range.flags & RangeFlag::Gte) || keyView >= range.gt) ) {
-            onValue(std::string(keyView), std::string((char*)valueVal.mv_data, valueVal.mv_size));
+            std::string key(keyView);
+            std::string value(std::string((char*)valueVal.mv_data, valueVal.mv_size));
+            loop->defer([onValue, key{std::move(key)}, value{std::move(value)}]() {
+              onValue(key, value);
+            });
             readCount++;
           }
           ret =  mdb_cursor_get(cursor, &keyVal, &valueVal, MDB_NEXT);
-          fprintf(stderr, "RET %d KEY AFTER NEXT %s = %s\n", ret,
+          /*db_log("RET %d KEY AFTER NEXT %s = %s", ret,
                   keyVal.mv_size > 0 ? std::string((const char*)keyVal.mv_data, keyVal.mv_size).c_str() : "",
-                  valueVal.mv_size > 0 ? std::string((const char*)valueVal.mv_data, valueVal.mv_size).c_str() : "");
+                  valueVal.mv_size > 0 ? std::string((const char*)valueVal.mv_data, valueVal.mv_size).c_str() : "");*/
         }
       }
-      onEnd();
+      loop->defer([onEnd]() { onEnd(); });
 
       mdb_cursor_close(cursor);
       mdb_txn_abort(txn);
@@ -385,9 +407,9 @@ public:
     std::shared_ptr<Store> self = shared_from_this();
     uWS::Loop* loop = uWS::Loop::get();
     taskQueue.enqueue([loop, self, this, range, onCount{std::move(onCount)}]() {
-      fprintf(stderr, "GET RANGE!\n");
+      db_log("COUNT RANGE!");
       if(finished) {
-        fprintf(stderr, "GET Count WHEN FINISHED!\n");
+        db_log("GET Count WHEN FINISHED!");
         loop->defer([onCount]() { onCount(0, ""); });
         return;
       }
@@ -401,22 +423,30 @@ public:
       int ret;
       MDB_val keyVal;
 
+      std::string lastKey = "";
+
       if(range.flags & RangeFlag::Reverse) {
         if(range.flags & (RangeFlag::Lt | RangeFlag::Lte)) {
           keyVal.mv_size = range.lt.size();
           keyVal.mv_data = (void*)range.lt.data();
           ret = mdb_cursor_get(cursor, &keyVal, nullptr, MDB_SET_RANGE);
-          fprintf(stderr, "SET_RANGE RET %d\n", ret);
-          fprintf(stderr, "KEY AFTER SET_RANGE %s = %s\n", range.lt.c_str(),
-                  std::string((const char*)keyVal.mv_data, keyVal.mv_size).c_str());
+          /*db_log("SET_RANGE RET %d", ret);
+          db_log("KEY AFTER SET_RANGE %s = %s", range.lt.c_str(),
+                  (ret == 0 && keyVal.mv_size > 0)
+                  ? std::string((const char*)keyVal.mv_data, keyVal.mv_size).c_str()
+                  : "");*/
           if(ret == MDB_NOTFOUND) {
             ret = mdb_cursor_get(cursor, &keyVal, nullptr, MDB_LAST);
-            fprintf(stderr, "LAST RET %d\n", ret);
-            fprintf(stderr, "KEY AFTER LAST %s = %s\n", range.lt.c_str(),
-                    std::string((const char*)keyVal.mv_data, keyVal.mv_size).c_str());
+            /*db_log("LAST RET %d", ret);
+            db_log("KEY AFTER LAST %s = %s", range.lt.c_str(),
+                    (ret == 0 && keyVal.mv_size > 0)
+                    ? std::string((const char*)keyVal.mv_data, keyVal.mv_size).c_str()
+                    : "");*/
           }
+          if(ret == 0 && keyVal.mv_size > 0) lastKey = std::string((const char*)keyVal.mv_data, keyVal.mv_size);
         } else {
-          mdb_cursor_get(cursor, &keyVal, nullptr, MDB_LAST);
+          ret = mdb_cursor_get(cursor, &keyVal, nullptr, MDB_LAST);
+          if(ret == 0 && keyVal.mv_size > 0) lastKey = std::string((const char*)keyVal.mv_data, keyVal.mv_size);
         }
         while((!isLimited || readCount < range.limit) && ret != MDB_NOTFOUND) {
           std::string_view keyView((char*)keyVal.mv_data, keyVal.mv_size);
@@ -426,20 +456,27 @@ public:
               && (!(range.flags & RangeFlag::Lte) || keyView <= range.lt) ) {
             readCount++;
           }
-          ret =  mdb_cursor_get(cursor, &keyVal, nullptr, MDB_PREV);
-          fprintf(stderr, "RET %d KEY AFTER NEXT %s\n", ret,
-                  keyVal.mv_size > 0 ? std::string((const char*)keyVal.mv_data, keyVal.mv_size).c_str() : "");
+          ret = mdb_cursor_get(cursor, &keyVal, nullptr, MDB_PREV);
+          if(ret == 0 && keyVal.mv_size > 0) lastKey = std::string((const char*)keyVal.mv_data, keyVal.mv_size);
+          /*db_log("RET %d KEY AFTER NEXT %s", ret,
+                  (ret == 0 && keyVal.mv_size > 0)
+                  ? std::string((const char*)keyVal.mv_data, keyVal.mv_size).c_str()
+                  : "");*/
         }
       } else {
         if(range.flags & (RangeFlag::Gt | RangeFlag::Gte)) {
           keyVal.mv_size = range.gt.size();
           keyVal.mv_data = (void*)range.gt.data();
           ret = mdb_cursor_get(cursor, &keyVal, nullptr, MDB_SET_RANGE);
-          fprintf(stderr, "SET_RANGE RET %d\n", ret);
-          fprintf(stderr, "KEY AFTER SET_RANGE %s = %s\n", range.gt.c_str(),
-                  std::string((const char*)keyVal.mv_data, keyVal.mv_size).c_str());
+          if(ret == 0 && keyVal.mv_size > 0) lastKey = std::string((const char*)keyVal.mv_data, keyVal.mv_size);
+          /*db_log("SET_RANGE RET %d", ret);
+          db_log("KEY AFTER SET_RANGE %s = %s", range.gt.c_str(),
+                  (ret == 0 && keyVal.mv_size > 0)
+                  ? std::string((const char*)keyVal.mv_data, keyVal.mv_size).c_str()
+                  : "");*/
         } else {
-          mdb_cursor_get(cursor, &keyVal, nullptr, MDB_FIRST);
+          ret = mdb_cursor_get(cursor, &keyVal, nullptr, MDB_FIRST);
+          if(ret == 0 && keyVal.mv_size > 0) lastKey = std::string((const char*)keyVal.mv_data, keyVal.mv_size);
         }
         while((!isLimited || readCount < range.limit) && ret != MDB_NOTFOUND) {
           std::string_view keyView((char*)keyVal.mv_data, keyVal.mv_size);
@@ -450,12 +487,14 @@ public:
             readCount++;
           }
           ret =  mdb_cursor_get(cursor, &keyVal, nullptr, MDB_NEXT);
-          fprintf(stderr, "RET %d KEY AFTER NEXT %s\n", ret,
-                  keyVal.mv_size > 0 ? std::string((const char*)keyVal.mv_data, keyVal.mv_size).c_str() : "");
+          if(ret == 0 && keyVal.mv_size > 0) lastKey = std::string((const char*)keyVal.mv_data, keyVal.mv_size);
+          /*db_log("RET %d KEY AFTER NEXT %s", ret,
+                  (ret == 0 && keyVal.mv_size > 0)
+                  ? std::string((const char*)keyVal.mv_data, keyVal.mv_size).c_str()
+                  : "");*/
         }
       }
-      fprintf(stderr, "COUNT RESULT %d\n", readCount);
-      std::string lastKey = std::string((char*)keyVal.mv_data, keyVal.mv_size);
+      db_log("COUNT RESULT %d", readCount);
       loop->defer([onCount, readCount, lastKey{std::move(lastKey)}]() { onCount(readCount, lastKey); });
 
       mdb_cursor_close(cursor);
@@ -468,10 +507,10 @@ public:
     std::shared_ptr<Store> self = shared_from_this();
     uWS::Loop* loop = uWS::Loop::get();
     Range range(rangeView);
-    taskQueue.enqueue([loop, self, this, range, onCount{std::move(onCount)}]() {
-      fprintf(stderr, "GET RANGE!\n");
+    writeQueue.enqueue([loop, self, this, range, onCount{std::move(onCount)}]() {
+      db_log("GET RANGE!");
       if(finished) {
-        fprintf(stderr, "GET Count WHEN FINISHED!\n");
+        db_log("GET Count WHEN FINISHED!");
         loop->defer([onCount]() { onCount(0, ""); });
         return;
       }
@@ -484,23 +523,31 @@ public:
       bool isLimited = range.flags & RangeFlag::Limit;
       int ret;
       MDB_val keyVal;
+      std::string lastKey;
 
       if(range.flags & RangeFlag::Reverse) {
         if(range.flags & (RangeFlag::Lt | RangeFlag::Lte)) {
           keyVal.mv_size = range.lt.size();
           keyVal.mv_data = (void*)range.lt.data();
           ret = mdb_cursor_get(cursor, &keyVal, nullptr, MDB_SET_RANGE);
-          fprintf(stderr, "SET_RANGE RET %d\n", ret);
-          fprintf(stderr, "KEY AFTER SET_RANGE %s = %s\n", range.lt.c_str(),
-                  std::string((const char*)keyVal.mv_data, keyVal.mv_size).c_str());
+          if(ret == 0 && keyVal.mv_size > 0) lastKey = std::string((const char*)keyVal.mv_data, keyVal.mv_size);
+          db_log("SET_RANGE RET %d", ret);
+          db_log("KEY AFTER SET_RANGE %s = %s", range.lt.c_str(),
+                  (ret == 0 && keyVal.mv_size > 0)
+                  ? std::string((const char*)keyVal.mv_data, keyVal.mv_size).c_str()
+                  : "");
           if(ret == MDB_NOTFOUND) {
             ret = mdb_cursor_get(cursor, &keyVal, nullptr, MDB_LAST);
-            fprintf(stderr, "LAST RET %d\n", ret);
-            fprintf(stderr, "KEY AFTER LAST %s = %s\n", range.lt.c_str(),
-                    std::string((const char*)keyVal.mv_data, keyVal.mv_size).c_str());
+            if(ret == 0 && keyVal.mv_size > 0) lastKey = std::string((const char*)keyVal.mv_data, keyVal.mv_size);
+            db_log("LAST RET %d", ret);
+            db_log("KEY AFTER LAST %s = %s", range.lt.c_str(),
+                    (ret == 0 && keyVal.mv_size > 0)
+                    ? std::string((const char*)keyVal.mv_data, keyVal.mv_size).c_str()
+                    : "");
           }
         } else {
-          mdb_cursor_get(cursor, &keyVal, nullptr, MDB_LAST);
+          ret = mdb_cursor_get(cursor, &keyVal, nullptr, MDB_LAST);
+          if(ret == 0 && keyVal.mv_size > 0) lastKey = std::string((const char*)keyVal.mv_data, keyVal.mv_size);
         }
         while((!isLimited || readCount < range.limit) && ret != MDB_NOTFOUND) {
           std::string_view keyView((char*)keyVal.mv_data, keyVal.mv_size);
@@ -513,19 +560,26 @@ public:
             readCount++;
           }
           ret =  mdb_cursor_get(cursor, &keyVal, nullptr, MDB_PREV);
-          fprintf(stderr, "RET %d KEY AFTER NEXT %s\n", ret,
-                  keyVal.mv_size > 0 ? std::string((const char*)keyVal.mv_data, keyVal.mv_size).c_str() : "");
+          if(ret == 0 && keyVal.mv_size > 0) lastKey = std::string((const char*)keyVal.mv_data, keyVal.mv_size);
+          db_log("RET %d KEY AFTER NEXT %s", ret,
+                  (ret == 0 && keyVal.mv_size > 0)
+                  ? std::string((const char*)keyVal.mv_data, keyVal.mv_size).c_str()
+                  : "");
         }
       } else {
         if(range.flags & (RangeFlag::Gt | RangeFlag::Gte)) {
           keyVal.mv_size = range.gt.size();
           keyVal.mv_data = (void*)range.gt.data();
           ret = mdb_cursor_get(cursor, &keyVal, nullptr, MDB_SET_RANGE);
-          fprintf(stderr, "SET_RANGE RET %d\n", ret);
-          fprintf(stderr, "KEY AFTER SET_RANGE %s = %s\n", range.gt.c_str(),
-                  std::string((const char*)keyVal.mv_data, keyVal.mv_size).c_str());
+          if(ret == 0 && keyVal.mv_size > 0) lastKey = std::string((const char*)keyVal.mv_data, keyVal.mv_size);
+          db_log("SET_RANGE RET %d", ret);
+          db_log("KEY AFTER SET_RANGE %s = %s", range.gt.c_str(),
+                  (ret == 0 && keyVal.mv_size > 0)
+                  ? std::string((const char*)keyVal.mv_data, keyVal.mv_size).c_str()
+                  : "");
         } else {
-          mdb_cursor_get(cursor, &keyVal, nullptr, MDB_FIRST);
+          ret = mdb_cursor_get(cursor, &keyVal, nullptr, MDB_FIRST);
+          if(ret == 0 && keyVal.mv_size > 0) lastKey = std::string((const char*)keyVal.mv_data, keyVal.mv_size);
         }
         while((!isLimited || readCount < range.limit) && ret != MDB_NOTFOUND) {
           std::string_view keyView((char*)keyVal.mv_data, keyVal.mv_size);
@@ -538,12 +592,14 @@ public:
             readCount++;
           }
           ret =  mdb_cursor_get(cursor, &keyVal, nullptr, MDB_NEXT);
-          fprintf(stderr, "RET %d KEY AFTER NEXT %s\n", ret,
-                  keyVal.mv_size > 0 ? std::string((const char*)keyVal.mv_data, keyVal.mv_size).c_str() : "");
+          if(ret == 0 && keyVal.mv_size > 0) lastKey = std::string((const char*)keyVal.mv_data, keyVal.mv_size);
+          db_log("RET %d KEY AFTER NEXT %s", ret,
+                  (ret == 0 && keyVal.mv_size > 0)
+                  ? std::string((const char*)keyVal.mv_data, keyVal.mv_size).c_str()
+                  : "");
         }
       }
-      fprintf(stderr, "DELETE COUNT %d\n", readCount);
-      std::string lastKey = std::string((char*)keyVal.mv_data, keyVal.mv_size);
+      db_log("DELETE COUNT %d", readCount);
       loop->defer([onCount, readCount, lastKey{std::move(lastKey)}]() { onCount(readCount, lastKey); });
 
       mdb_cursor_close(cursor);

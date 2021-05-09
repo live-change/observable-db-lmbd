@@ -33,7 +33,7 @@ ObjectObservation::~ObjectObservation() {
 }
 
 RangeObservation::RangeObservation(std::shared_ptr<Store> storep, const Range& rangep, int idp)
-  : store(storep), range(rangep), id(idp) {}
+  : Observation(), store(storep), range(rangep), id(idp) {}
 void RangeObservation::close() {
   finished = true;
   store->handleRangeObservationRemoved(range, id);
@@ -59,19 +59,26 @@ void RangeDataObservation::init() {
     self->keys.push_back(key);
     return;
   }, [self]() {
+    db_log("RANGE READ DONE!");
     if(self->finished) return;
+    db_log("RANGE READ DONE!!");
     self->waitingForRead = false;
     self->onChanges();
-    for(auto const& [ found, created, key, value ] : self->waitingOperations) {
+    std::vector<std::tuple<bool, bool, std::string, std::string>> ops = self->waitingOperations;
+    self->waitingOperations.clear();
+    for(auto const& [ found, created, key, value ] : ops) {
       self->processOperation(found, created, key, value);
       if(self->waitingForRead) break;
     }
   });
 }
 
-void RangeDataObservation::handleOperation(bool found, bool created, const std::string& key, const std::string& value) {
+void RangeDataObservation::handleOperation(bool found, bool created, const std::string& keyp, const std::string& valuep) {
+  db_log("DATA %d HANDLE OPERATION %d %d %s", id, found, created, keyp.c_str());
   std::shared_ptr<RangeDataObservation> self = shared_from_this();
-  loop->defer([self, found, created, key{std::move(key)}, value{std::move(value)}](){
+  std::string key = keyp;
+  std::string value = valuep;
+  loop->defer([self, found, created, key, value](){
     if(self->waitingForRead) {
       self->waitingOperations.push_back(std::make_tuple(found, created, key, value));
       return;
@@ -83,30 +90,43 @@ void RangeDataObservation::handleOperation(bool found, bool created, const std::
 
 void RangeDataObservation::processOperation(bool found, bool created,
                                             const std::string& key, const std::string& value) {
+  if(range.gt == "accessControl_") {
+    fprintf(stderr, "ACCESS CONTROL DATA %d PROCESS OPERATION %d %d %s\n", id, found, created, key.c_str());
+  }
+  db_log("DATA %d PROCESS OPERATION %d %d %s", id, found, created, key.c_str());
   if(finished) return;
   if((range.flags & RangeFlag::Gt) && !(key > range.gt)) throw std::runtime_error("key not in range");
   if((range.flags & RangeFlag::Lt) && !(key < range.lt)) throw std::runtime_error("key not in range");
   if((range.flags & RangeFlag::Gte) && !(key >= range.gt)) throw std::runtime_error("key not in range");
   if((range.flags & RangeFlag::Lte) && !(key <= range.lt)) throw std::runtime_error("key not in range");
   if(range.flags & RangeFlag::Limit) { // complex logic with limits
+    db_log("DATA %d PROCESS LIMITED", id);
     if(found) { // add to limit - may overflow
       if (created) { // new object may overflow
-        fprintf(stderr, "add to limited\n");
-        bool end = ((range.flags & RangeFlag::Reverse) ? keys.back() > key : keys.back() < key);
-        fprintf(stderr, "KS %zd LT %d E %d\n", keys.size(), range.limit, end);
-        if (keys.size() == range.limit && end)
+        db_log("add to limited");
+        bool end = (keys.size() == 0) || ((range.flags & RangeFlag::Reverse) ? keys.back() > key : keys.back() < key);
+        db_log("KS %zd LT %d E %d", keys.size(), range.limit, end);
+        if (keys.size() == range.limit && end) {
+          for(int i = 0; i < keys.size(); i++) {
+            db_log("KEY %d : %s", i, keys[i].c_str());
+          }
           return; // insert over limit - ignore
+        }
         auto it = keys.end();
         if (!end) {
           it = keys.begin();
           for (; it != keys.end(); it++) {
-            if ((range.flags & RangeFlag::Reverse) ? *it < key : *it > key) {
+            if ((range.flags & RangeFlag::Reverse) ? *it <= key : *it >= key) {
               break;
             }
           }
+          if(*it == key) { // key update
+            onValue(true, false, false, key, value);
+            return;
+          }
         }
         if (keys.size() == range.limit) { // insert created overflow
-          fprintf(stderr, "overflow!\n");
+          db_log("overflow!");
           onValue(false, false, false, keys.back(), "");
           onValue(true, true, false, key, value);
         } else {
@@ -117,7 +137,7 @@ void RangeDataObservation::processOperation(bool found, bool created,
         } else {
           keys.insert(it, key);
           if(keys.size() > range.limit) {
-            fprintf(stderr, "RESIZE KEYS %zd -> %d\n", keys.size(), range.limit);
+            db_log("RESIZE KEYS %zd -> %d", keys.size(), range.limit);
             keys.resize(range.limit);
           }
         }
@@ -125,7 +145,7 @@ void RangeDataObservation::processOperation(bool found, bool created,
         onValue(true, false, false, key, value);
       }
     } else {
-      fprintf(stderr, "remove from limited\n");
+      db_log("remove from limited");
       bool exists = false;
       auto it = keys.begin();
       for (; it != keys.end(); it++) {
@@ -138,41 +158,60 @@ void RangeDataObservation::processOperation(bool found, bool created,
         }
       }
       if(exists) {
+        bool needRefill = keys.size() == range.limit;
         onValue(false, false, false, key, "");
         keys.erase(it);
+        if(range.gt == "accessControl_") {
+          fprintf(stderr, "KEYS AFTER ERASE %s = %zd   NEED REFILL %d\n", key.c_str(), keys.size(), needRefill);
+        }
+        if(!needRefill) return;
         waitingForRead = true;
         std::shared_ptr<RangeDataObservation> self = shared_from_this();
         Range refillRange = range;
-        if(refillRange.flags & RangeFlag::Reverse) {
-          refillRange.flags &= ~RangeFlag::Lte;
-          refillRange.flags |= RangeFlag::Lt;
-          refillRange.lt = keys.back();
-          refillRange.limit = range.limit - keys.size();
-        } else {
-          fprintf(stderr, "REFILL FLAGS %d\n", refillRange.flags);
-          refillRange.flags &= ~RangeFlag::Gte;
-          fprintf(stderr, "REFILL FLAGS %d\n", refillRange.flags);
-          refillRange.flags |= RangeFlag::Gt;
-          fprintf(stderr, "REFILL FLAGS %d\n", refillRange.flags);
-          refillRange.gt = keys.back();
-          refillRange.limit = range.limit - keys.size();
-          fprintf(stderr, "REFILL RANGE gt:%s %s:%s limit:%d flags:%d\n", refillRange.gt.c_str(),
-                  refillRange.flags & RangeFlag::Lt ? "lt" : (refillRange.flags & RangeFlag::Lte ? "lte" : ""),
-                  refillRange.lt.c_str(),
-                  refillRange.limit, refillRange.flags);
+        if(keys.size() > 0) { // else reload all
+          if (refillRange.flags & RangeFlag::Reverse) {
+            refillRange.flags &= ~RangeFlag::Lte;
+            refillRange.flags |= RangeFlag::Lt;
+            refillRange.lt = keys.back();
+            refillRange.limit = range.limit - keys.size();
+          } else {
+            db_log("REFILL FLAGS %d", refillRange.flags);
+            refillRange.flags &= ~RangeFlag::Gte;
+            db_log("REFILL FLAGS %d", refillRange.flags);
+            refillRange.flags |= RangeFlag::Gt;
+            db_log("REFILL FLAGS %d", refillRange.flags);
+            refillRange.gt = keys.back();
+            refillRange.limit = range.limit - keys.size();
+            db_log("REFILL RANGE gt:%s %s:%s limit:%d flags:%d", refillRange.gt.c_str(),
+                    refillRange.flags & RangeFlag::Lt ? "lt" : (refillRange.flags & RangeFlag::Lte ? "lte" : ""),
+                    refillRange.lt.c_str(),
+                    refillRange.limit, refillRange.flags);
+          }
+        }
+        if(self->range.gt == "accessControl_") {
+          fprintf(stderr, "START AC REFILL WITH KEYS %zd\n", self->keys.size());
         }
         store->getRange(refillRange, [self](const std::string& key, const std::string& value) {
           if(self->finished) return;
           self->onValue(true, true, true, key, value);
           self->keys.push_back(key);
+          if(self->range.gt == "accessControl_") {
+            fprintf(stderr, "REFILL WITH %s\n", key.c_str());
+          }
           return;
         }, [self]() {
           if(self->finished) return;
+          if(self->range.gt == "accessControl_") {
+            fprintf(stderr, "REFILL FINISHED KEYS COUNT %zd\n", self->keys.size());
+          }
           self->waitingForRead = false;
-          for(auto const& [ found, created, key, value ] : self->waitingOperations) {
+          std::vector<std::tuple<bool, bool, std::string, std::string>> ops = self->waitingOperations;
+          self->waitingOperations.clear();
+          for(auto const& [ found, created, key, value ] : ops) {
             self->processOperation(found, created, key, value);
             if(self->waitingForRead) break;
           }
+
         });
       }
     }
@@ -194,13 +233,13 @@ void RangeCountObservation::recount() {
   std::shared_ptr<RangeCountObservation> self = shared_from_this();
   store->getCount(range, [self](int cnt, const std::string& last) {
     if(self->finished) return;
-    fprintf(stderr, "GET COUNT RESULT %d FIRST COUNT %d\n", cnt, self->firstCount);
+    db_log("GET COUNT RESULT %d FIRST COUNT %d", cnt, self->firstCount);
     if((self->range.flags & RangeFlag::Limit) && cnt == self->range.limit) {
       self->lastKey = last;
       self->lastKeyLimit = true;
     }
     if(self->needRecount) {
-      fprintf(stderr, "NEED RECOUNT!\n");
+      db_log("NEED RECOUNT!");
       if(self->firstCount || cnt != self->count) {
         self->firstCount = false;
         self->count = cnt;
@@ -224,14 +263,14 @@ void RangeCountObservation::recount() {
 }
 
 void RangeCountObservation::handleOperation(bool found, bool created, const std::string& key, const std::string& value) {
-  fprintf(stderr, "COUNT HANDLE OPERATION %d %d %s", found, created, key.c_str());
+  db_log("COUNT HANDLE OPERATION %d %d %s", found, created, key.c_str());
   std::shared_ptr<RangeCountObservation> self = shared_from_this();
   loop->defer([self, found, created, key{std::move(key)}, value{std::move(value)}](){
     self->processOperation(found, created, key, value);
   });
 }
 void RangeCountObservation::processOperation(bool found, bool created, const std::string& key, const std::string& value) {
-  fprintf(stderr, "COUNT PROCESS OPERATION %d %d %s", found, created, key.c_str());
+  db_log("COUNT PROCESS OPERATION %d %d %s", found, created, key.c_str());
   if(finished) return;
   if(found && !created) return; // ignore value updates
   if((range.flags & RangeFlag::Gt) && !(key > range.gt)) throw std::runtime_error("key not in range");

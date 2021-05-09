@@ -1,8 +1,10 @@
 #include <stdio.h>
 #include <boost/program_options.hpp>
 #include <uWebSockets/App.h>
+#include <uWebSockets/WebSocket.h>
 #include <filesystem>
 #include <unordered_set>
+#include <concurrentqueue/concurrentqueue.h>
 #include "PacketBuffer.h"
 #include "range.h"
 #include "Database.h"
@@ -11,6 +13,7 @@ namespace options {
   std::string dir;
   int port = 3530;
   int threads = 8;
+  unsigned int maxBackpressure = 100 * 1024 * 1024;
 }
 
 void parseOptions(int argc, char** argv) {
@@ -29,7 +32,7 @@ void parseOptions(int argc, char** argv) {
   po::notify(vm);
 
   if (!vm.count("dir")) {
-    fprintf(stderr, "directory parameter is required \n");
+    db_log("directory parameter is required ");
     exit(1);
   }
 
@@ -49,15 +52,18 @@ void getDatabase(std::string name, std::function<void(std::shared_ptr<Database>)
     std::shared_ptr<Database> database = nullptr;
     auto it = databases.find(name);
     if(it != databases.end()) {
+      db_log("Database IT found %s", name.c_str());
       database = it->second.lock();
     }
     if(database != nullptr) {
+      db_log("Database found %s", name.c_str());
       loop->defer([callback, database](){
         callback(database);
       });
       return;
     }
     std::string path = options::dir + "/" + name;
+    db_log("Database dir %s", path.c_str());
     if(!std::filesystem::exists(path)) {
       loop->defer([callback, database]() {
         callback(nullptr);
@@ -65,6 +71,7 @@ void getDatabase(std::string name, std::function<void(std::shared_ptr<Database>)
       return;
     }
     database = std::make_shared<Database>(path);
+    databases[name] = database;
     loop->defer([callback, database]() {
       callback(database);
     });
@@ -85,6 +92,7 @@ void createDatabase(std::string name, std::string settingsJson,
       loop->defer([onError]() {
         onError("exists");
       });
+      return;
     }
     std::filesystem::create_directories(path);
     loop->defer([onOk]() {
@@ -99,7 +107,7 @@ void deleteDatabase(std::string name,
     std::string path = options::dir + "/" + name;
     if(!std::filesystem::exists(path)) {
       loop->defer([onError]() {
-        onError("not_found");
+        onError("database_not_found");
       });
       return;
     }
@@ -108,7 +116,9 @@ void deleteDatabase(std::string name,
     if(it != databases.end()) {
       database = it->second.lock();
     }
+    db_log("Close database %s", name.c_str());
     if(database != nullptr) database->close();
+    db_log("Delete database %s", path.c_str());
     std::filesystem::remove_all(path);
     if(it != databases.end()) {
       databases.erase(it);
@@ -177,7 +187,7 @@ public:
   }
   void handleMessage(char* buffer, int size) {
     net::PacketBuffer packet(buffer, size);
-    //fprintf(stderr,"RECEIVED PACKET!\n");
+    //db_log("RECEIVED PACKET!");
     //packet.print();
     uint8_t opCode = packet.readU8();
     std::shared_ptr<ClientConnection> self = shared_from_this();
@@ -195,6 +205,7 @@ public:
         int requestId = packet.readU32();
         std::string databaseName = packet.readString(packet.readU8());
         std::string jsonSettings = packet.readString(packet.readU16());
+        db_log("CREATE DATABASE %s", databaseName.c_str());
         createDatabase(databaseName, jsonSettings, [requestId, self](){
           self->sendOk(requestId);
         }, [requestId, self](std::string error){
@@ -227,7 +238,7 @@ public:
           database->getStore(
             storeName, [requestId, storeId, self](std::shared_ptr<Store> store){
               if(!store) {
-                self->sendError(requestId, "not_found");
+                self->sendError(requestId, "store_not_found");
                 return;
               }
               self->openStores[storeId] = store;
@@ -250,6 +261,7 @@ public:
         int requestId = packet.readU32();
         std::string databaseName = packet.readString(packet.readU8());
         std::string storeName = packet.readString(packet.readU8());
+        db_log("CREATE STORE %s / %s", databaseName.c_str(), storeName.c_str());
         getDatabase(databaseName, [requestId, self, storeName](std::shared_ptr<Database> database) {
           if (!database) {
             self->sendError(requestId, "database_not_found");
@@ -327,7 +339,7 @@ public:
           resultPacket.writeU32(requestId);
           resultPacket.writeU32(count);
           resultPacket.flip();
-          sendCallback(resultPacket.getPointer(0), resultPacket.size());
+          send(resultPacket.getPointer(0), resultPacket.size());
         });
       } break;
 
@@ -356,21 +368,23 @@ public:
         }
         RangeView range(packet);
         store->getRange(range, [this, requestId](std::string_view key, std::string_view value) {
-          net::PacketBuffer resultPacket(key.size() + value.size() + 14);
+          net::PacketBuffer resultPacket(key.size() + value.size() + 15);
           resultPacket.writeU8((uint8_t) OpCode::ResultPut);
           resultPacket.writeU32(requestId);
+          int flags = 0 | (int)ResultPutFlags::Found | (int)ResultPutFlags::Created | (int)ResultPutFlags::Last;
+          resultPacket.writeU8(flags);
           resultPacket.writeU16(key.size());
           resultPacket.writeBytes(key.data(), key.size());
           resultPacket.writeU32(value.size());
           resultPacket.writeBytes(value.data(), value.size());
           resultPacket.flip();
-          sendCallback(resultPacket.getPointer(0), resultPacket.size());
+          send(resultPacket.getPointer(0), resultPacket.size());
         }, [this, requestId]() {
           net::PacketBuffer resultPacket(10);
           resultPacket.writeU8((uint8_t) OpCode::ResultsDone);
           resultPacket.writeU32(requestId);
           resultPacket.flip();
-          sendCallback(resultPacket.getPointer(0), resultPacket.size());
+          send(resultPacket.getPointer(0), resultPacket.size());
         });
       } break;
       case (uint8_t)OpCode::GetCount: {
@@ -389,12 +403,12 @@ public:
           resultPacket.writeU32(count);
           resultPacket.writeString(lastKey);
           resultPacket.flip();
-          sendCallback(resultPacket.getPointer(0), resultPacket.size());
+          send(resultPacket.getPointer(0), resultPacket.size());
         });
       } break;
 
       case (uint8_t)OpCode::Observe: {
-        fprintf(stderr, "RECEIVED OBSERVE\n");
+        db_log("RECEIVED OBSERVE");
         int requestId = packet.readU32();
         if(observations.find(requestId) != observations.end()) {
           sendError(requestId, "exists");
@@ -409,7 +423,7 @@ public:
         int keySize = packet.readU16();
         char* keyData = packet.readPointer(keySize);
         std::string_view key = std::string_view(keyData, keySize);
-        fprintf(stderr, "OBSERVE OBJECT\n");
+        db_log("OBSERVE OBJECT");
         std::shared_ptr<Observation> observation =
           store->observeObject(key, [requestId, this](bool found, const std::string& value){
             if(found) {
@@ -418,16 +432,17 @@ public:
               resultPacket.writeU32(requestId);
               resultPacket.writeBytes(value.data(), value.size());
               resultPacket.flip();
-              sendCallback(resultPacket.getPointer(0), resultPacket.size());
+              send(resultPacket.getPointer(0), resultPacket.size());
             } else {
               net::PacketBuffer resultPacket(10);
               resultPacket.writeU8((uint8_t) OpCode::ResultNotFound);
               resultPacket.writeU32(requestId);
               resultPacket.flip();
-              sendCallback(resultPacket.getPointer(0), resultPacket.size());
+              send(resultPacket.getPointer(0), resultPacket.size());
             }
           });
         observations[requestId] = observation;
+        db_log("OBSERVE! %d", requestId);
       } break;
       case (uint8_t)OpCode::ObserveRange: {
         int requestId = packet.readU32();
@@ -458,19 +473,20 @@ public:
               resultPacket.writeBytes(value.data(), value.size());
             }
             resultPacket.flip();
-            fprintf(stderr,"SEND RESULT PUT PACKET!\n");
-            resultPacket.print();
-            sendCallback(resultPacket.getPointer(0), resultPacket.size());
+           /* db_log("SEND RESULT PUT PACKET!");
+            resultPacket.print();*/
+            send(resultPacket.getPointer(0), resultPacket.size());
           }, [requestId, this](){
             net::PacketBuffer resultPacket(12);
             resultPacket.writeU8((uint8_t)OpCode::ResultsChanges);
             resultPacket.writeU32(requestId);
             resultPacket.flip();
-            fprintf(stderr,"SEND RESULT CHANGES PACKET!\n");
+            send(resultPacket.getPointer(0), resultPacket.size());
+            db_log("SENT RESULT CHANGES PACKET!");
             resultPacket.print();
-            sendCallback(resultPacket.getPointer(0), resultPacket.size());
           });
         observations[requestId] = observation;
+        db_log("OBSERVE! %d", requestId);
       } break;
       case (uint8_t)OpCode::ObserveCount: {
         int requestId = packet.readU32();
@@ -492,16 +508,18 @@ public:
             resultPacket.writeU32(requestId);
             resultPacket.writeU32(count);
             resultPacket.flip();
-            sendCallback(resultPacket.getPointer(0), resultPacket.size());
+            send(resultPacket.getPointer(0), resultPacket.size());
           });
         observations[requestId] = observation;
+        db_log("OBSERVE! %d", requestId);
       } break;
 
       case (uint8_t)OpCode::Unobserve: {
         int requestId = packet.readU32();
+        db_log("UNOBSERVE! %d", requestId);
         auto it = observations.find(requestId);
-        if(it != observations.end()) {
-          sendError(requestId, "not_found");
+        if(it == observations.end()) {
+          sendError(requestId, "observation_not_found");
           break;
         }
         std::shared_ptr<Observation> observation = it->second;
@@ -518,13 +536,13 @@ public:
       resultPacket.writeU32(requestId);
       resultPacket.writeBytes(obj.data(), obj.size());
       resultPacket.flip();
-      sendCallback(resultPacket.getPointer(0), resultPacket.size());
+      send(resultPacket.getPointer(0), resultPacket.size());
     } else {
       net::PacketBuffer resultPacket(10);
       resultPacket.writeU8((uint8_t) OpCode::ResultNotFound);
       resultPacket.writeU32(requestId);
       resultPacket.flip();
-      sendCallback(resultPacket.getPointer(0), resultPacket.size());
+      send(resultPacket.getPointer(0), resultPacket.size());
     }
   }
   
@@ -534,8 +552,8 @@ public:
     resultPacket.writeU32(requestId);
     resultPacket.writeString(error);
     resultPacket.flip();
-    fprintf(stderr,"SEND ERROR %s!\n", error.c_str());
-    sendCallback(resultPacket.getPointer(0), resultPacket.size());
+    db_log("SEND ERROR %s!", error.c_str());
+    send(resultPacket.getPointer(0), resultPacket.size());
   }
   
   void sendOk(int requestId) {
@@ -543,9 +561,20 @@ public:
     resultPacket.writeU8((uint8_t)OpCode::Ok);
     resultPacket.writeU32(requestId);
     resultPacket.flip();
-/*    fprintf(stderr,"SEND PACKET!\n");
+/*    db_log("SEND PACKET!");
     resultPacket.print();*/
-    sendCallback(resultPacket.getPointer(0), resultPacket.size());
+    send(resultPacket.getPointer(0), resultPacket.size());
+  }
+
+  void send(char* buffer, size_t size) {
+    sendCallback(buffer, size);
+  }
+
+  void pause() { // pause workers operations on backpressure
+
+  }
+  void resume() { // resume workers operations
+
   }
   
 };
@@ -571,27 +600,45 @@ int main(int argc, char** argv) {
   };
 
   for(int i = 0; i < options::threads; i++) {
-    std::thread worker(workerThread);
+    std::thread worker(workerThreadLoop);
     lmdbThreadPool.push_back(std::move(worker));
   }
+
+  writeThread = std::thread(writeThreadLoop);
 
   wsApp.ws<PerSocketData>("/*", {
       /* Settings */
       .compression = uWS::DEDICATED_COMPRESSOR_3KB,
       .maxPayloadLength = 16 * 1024 * 1024,
-      .idleTimeout = 10,
-      .maxBackpressure = 1 * 1024 * 1024,
+      .idleTimeout = 100000,
+      .maxBackpressure = options::maxBackpressure,
       /* Handlers */
       .upgrade = nullptr,
       .open = [](auto *ws) {
         PerSocketData* socketData = (PerSocketData*)ws->getUserData();
+        auto connectionThreadId = std::this_thread::get_id();
         socketData->connection = std::make_shared<ClientConnection>();
-        socketData->connection->handleOpen([ws](char* data, int size) {
-          ws->send(std::string_view(data, size), uWS::OpCode::BINARY);
+        socketData->connection->handleOpen([ws, connectionThreadId](char* data, int size) {
+          auto threadId = std::this_thread::get_id();
+          assert(threadId == connectionThreadId);
+          size_t bufferedAmount = ws->getBufferedAmount();
+          if(bufferedAmount > options::maxBackpressure) {
+            db_log("PACKET DROP %zd > %d !!!", bufferedAmount, options::maxBackpressure);
+            ws->close();
+          }
+          ws->cork([ws, data, size, bufferedAmount] {
+            bool sent = ws->send(std::string_view(data, size), uWS::OpCode::BINARY);
+            if(!sent) {
+              size_t newBufferedAmount = ws->getBufferedAmount();
+              db_log("PACKET BUFFERED, buffer growth %zd -> %zd / %d",
+                      bufferedAmount, newBufferedAmount, options::maxBackpressure);
+              //ws->close();
+              //exit(1);
+            }
+          });
         }, [ws]() {
           ws->close();
         });
-
       },
       .message = [](auto *ws, std::string_view message, uWS::OpCode opCode) {
         PerSocketData* socketData = (PerSocketData*)ws->getUserData();
@@ -600,8 +647,10 @@ int main(int argc, char** argv) {
         } else {
         }
       },
-      .drain = [](auto */*ws*/) {
-        /* Check getBufferedAmount here */
+      .drain = [](auto *ws) {
+        size_t bufferedAmount = ws->getBufferedAmount();
+        db_log("BUFFER DRAIN  %zd / %d",
+                bufferedAmount, options::maxBackpressure);
       },
       .ping = [](auto */*ws*/) {
 
@@ -617,7 +666,7 @@ int main(int argc, char** argv) {
     if (listen_socket) {
       global_listen_socket = listen_socket;
       if (listen_socket) {
-        std::cout << "Listening on port " << 9001 << std::endl;
+        std::cout << "Listening on port " << options::port << std::endl;
       }
     }
   }).run();

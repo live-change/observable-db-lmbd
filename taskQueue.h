@@ -13,7 +13,12 @@
 extern std::vector<std::thread> lmdbThreadPool;
 extern moodycamel::BlockingConcurrentQueue<std::function<void()>> taskQueue;
 
-void workerThread();
+extern std::thread writeThread;
+extern moodycamel::BlockingConcurrentQueue<std::function<void()>> writeQueue;
+
+void workerThreadLoop();
+
+void writeThreadLoop();
 
 
 #endif //OBSERVABLE_DB_LMDB_TASKQUEUE_H
