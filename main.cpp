@@ -305,8 +305,11 @@ public:
         int valueSize = packet.readU32();
         char *valueData = packet.readPointer(valueSize);
         std::string_view value(valueData, valueSize);
+        //fprintf(stderr, "PUT %s = %s\n", std::string(key).c_str(), std::string(value).c_str());
         store->put(key, value, [this, requestId](bool found, const std::string& obj) {
           sendResult(requestId, found, obj);
+        }, [requestId, self](std::string error){
+          self->sendError(requestId, error);
         });
       } break;
       case (uint8_t)OpCode::Delete: {
@@ -320,8 +323,11 @@ public:
         int keySize = packet.readU16();
         char* keyData = packet.readPointer(keySize);
         std::string_view key(keyData, keySize);
+        //fprintf(stderr, "DELETE %s\n", std::string(key).c_str());
         store->del(key, [this, requestId](bool found, const std::string& obj) {
           sendResult(requestId, found, obj);
+        }, [requestId, self](std::string error){
+          self->sendError(requestId, error);
         });
       } break;
       case (uint8_t)OpCode::DeleteRange: {

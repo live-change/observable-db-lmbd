@@ -70,6 +70,9 @@ void RangeDataObservation::init() {
       self->processOperation(found, created, key, value);
       if(self->waitingForRead) break;
     }
+/*    if((self->range.flags & RangeFlag::Gt) && self->store->name == "500004103500000000.data") {
+      fprintf(stderr, "INIT Triggers range %s keys %zd\n", self->range.gt.c_str(), self->keys.size());
+    }*/
   });
 }
 
@@ -84,15 +87,15 @@ void RangeDataObservation::handleOperation(bool found, bool created, const std::
       return;
     } else {
       self->processOperation(found, created, key, value);
+/*      if((self->range.flags & RangeFlag::Gt) && self->store->name == "500004103500000000.data") {
+        fprintf(stderr, "AFTER OP Triggers range %s keys %zd\n", self->range.gt.c_str(), self->keys.size());
+      }*/
     }
   });
 }
 
 void RangeDataObservation::processOperation(bool found, bool created,
                                             const std::string& key, const std::string& value) {
-  if(range.gt == "accessControl_") {
-    fprintf(stderr, "ACCESS CONTROL DATA %d PROCESS OPERATION %d %d %s\n", id, found, created, key.c_str());
-  }
   db_log("DATA %d PROCESS OPERATION %d %d %s", id, found, created, key.c_str());
   if(finished) return;
   if((range.flags & RangeFlag::Gt) && !(key > range.gt)) throw std::runtime_error("key not in range");
@@ -161,9 +164,9 @@ void RangeDataObservation::processOperation(bool found, bool created,
         bool needRefill = keys.size() == range.limit;
         onValue(false, false, false, key, "");
         keys.erase(it);
-        if(range.gt == "accessControl_") {
+        /*if(range.gt == "accessControl_") {
           fprintf(stderr, "KEYS AFTER ERASE %s = %zd   NEED REFILL %d\n", key.c_str(), keys.size(), needRefill);
-        }
+        }*/
         if(!needRefill) return;
         waitingForRead = true;
         std::shared_ptr<RangeDataObservation> self = shared_from_this();
@@ -188,30 +191,31 @@ void RangeDataObservation::processOperation(bool found, bool created,
                     refillRange.limit, refillRange.flags);
           }
         }
-        if(self->range.gt == "accessControl_") {
-          fprintf(stderr, "START AC REFILL WITH KEYS %zd\n", self->keys.size());
-        }
         store->getRange(refillRange, [self](const std::string& key, const std::string& value) {
           if(self->finished) return;
           self->onValue(true, true, true, key, value);
           self->keys.push_back(key);
-          if(self->range.gt == "accessControl_") {
-            fprintf(stderr, "REFILL WITH %s\n", key.c_str());
-          }
           return;
         }, [self]() {
           if(self->finished) return;
-          if(self->range.gt == "accessControl_") {
-            fprintf(stderr, "REFILL FINISHED KEYS COUNT %zd\n", self->keys.size());
-          }
+          /*if((self->range.flags & RangeFlag::Gt) && self->store->name == "500004103500000000.data") {
+            fprintf(stderr, "AFTER REFILL Triggers range %s keys %zd\n", self->range.gt.c_str(), self->keys.size());
+          }*/
           self->waitingForRead = false;
           std::vector<std::tuple<bool, bool, std::string, std::string>> ops = self->waitingOperations;
           self->waitingOperations.clear();
-          for(auto const& [ found, created, key, value ] : ops) {
+          for(auto it = ops.begin(); it!=ops.end(); ++it) {
+            auto const& [ found, created, key, value ] = *it;
             self->processOperation(found, created, key, value);
-            if(self->waitingForRead) break;
+            if(self->waitingForRead) { // Reinsert ops that are not finished
+              fprintf(stderr, "REFILL STARTED WHEN PROCESSING QUEUED CHANGED!!!\n");
+              self->waitingOperations.insert(self->waitingOperations.begin(), it, ops.end());
+              break;
+            }
           }
-
+/*          if((self->range.flags & RangeFlag::Gt) && self->store->name == "500004103500000000.data") {
+            fprintf(stderr, "AFTER REFILL OPS Triggers range %s keys %zd\n", self->range.gt.c_str(), self->keys.size());
+          }*/
         });
       }
     }

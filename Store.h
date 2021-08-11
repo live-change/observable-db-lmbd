@@ -32,16 +32,16 @@ private:
   boost::icl::interval_map<std::string, std::set<int>> rangeObservations;
   WeakFastSet<RangeObservation> allRangeObservations;
 
-  std::string name;
   MDB_env* env;
   MDB_dbi dbi;
   std::recursive_mutex stateMutex;
   bool finished = false;
   friend class Database;
 public:
+  std::string name;
 
   Store(std::shared_ptr<Database> databasep, std::string namep, MDB_env* envp)
-      : database(databasep), name(namep), env(envp) {
+      : database(databasep), env(envp), name(namep) {
 
   }
 
@@ -190,12 +190,13 @@ public:
   }
 
   void put(std::string_view keyp, std::string_view valuep,
-           std::function<void(bool found, const std::string&)> onResult) {
+           std::function<void(bool found, const std::string&)> onResult,
+           std::function<void(std::string)> onError) {
     std::shared_ptr<Store> self = shared_from_this();
     uWS::Loop* loop = uWS::Loop::get();
     std::string key = std::string(keyp);
     std::string value = std::string(valuep);
-    writeQueue.enqueue([loop, self, this, key, value, onResult]() {
+    writeQueue.enqueue([loop, self, this, key, value, onResult, onError]() {
       if(finished) {
         loop->defer([onResult]() { onResult(false, ""); });
         return;
@@ -212,7 +213,41 @@ public:
       db_log("GET RET %d %zd %zd", getRet, keyVal.mv_size, oldValueVal.mv_size);
       ret = mdb_put(txn, dbi, &keyVal, &valueVal, 0);
       db_log("PUT RET %d %zd %zd", ret, keyVal.mv_size, valueVal.mv_size);
-      mdb_txn_commit(txn);
+      if(ret != 0) {
+        loop->defer([onError, ret]() {
+          if (ret == MDB_MAP_FULL) {
+            onError("mapFull");
+            fprintf(stderr, "PUT FAILED -- NO MORE DISK SPACE AVAILABLE!\n");
+          } else {
+            onError(std::string("unknownError:") + std::to_string(ret));
+            fprintf(stderr, "PUT FAILED -- UNKNOWN ERROR %d\n", ret);
+          }
+        });
+        return;
+      }
+      ret = mdb_txn_commit(txn);
+      db_log("COMMIT RET %d", ret);
+      if(ret != 0) {
+        loop->defer([onError, ret]() {
+          if(ret == ENOSPC) {
+            onError("outOfDiskSpace");
+            fprintf(stderr, "COMMIT FAILED -- NO MORE DISK SPACE AVAILABLE!\n");
+          } else if(ret == EIO) {
+            onError("ioError");
+            fprintf(stderr, "COMMIT FAILED -- IO ERROR!\n");
+          } else if(ret == ENOMEM) {
+            onError("outOfMemory");
+            fprintf(stderr, "COMMIT FAILED -- OUT OF MEMORY!\n");
+          } else if(ret == EINVAL) {
+            onError("invalidParameter");
+            fprintf(stderr, "COMMIT FAILED -- INVALID PARAMETER!\n");
+          } else {
+            onError(std::string("unknownCommitError:")+std::to_string(ret));
+            fprintf(stderr, "COMMIT FAILED -- UNKNOWN ERROR %d\n", ret);
+          }
+        });
+        return;
+      }
 
 
       notifyObservers(true, getRet == MDB_NOTFOUND, key, value);
@@ -230,11 +265,12 @@ public:
     });
   }
   void del(std::string_view keyp,
-           std::function<void(bool found, const std::string&)> onResult) {
+           std::function<void(bool found, const std::string&)> onResult,
+           std::function<void(std::string)> onError) {
     std::shared_ptr<Store> self = shared_from_this();
     uWS::Loop* loop = uWS::Loop::get();
     std::string key = std::string(keyp);
-    writeQueue.enqueue([loop, self, this, key, onResult]() {
+    writeQueue.enqueue([loop, self, this, key, onResult, onError]() {
       if(finished) {
         loop->defer([onResult]() { onResult(false, ""); });
         return;
@@ -244,8 +280,31 @@ public:
       MDB_val keyVal = { .mv_size = key.size(), .mv_data = (void*)key.data() };
       MDB_val valueVal;
       int getRet = mdb_get(txn, dbi, &keyVal, &valueVal);
-      /*int ret = */mdb_del(txn, dbi, &keyVal, 0);
-      mdb_txn_commit(txn);
+      db_log("GET RET %d %zd %zd", getRet, keyVal.mv_size, valueVal.mv_size);
+      int ret = mdb_del(txn, dbi, &keyVal, 0);
+      db_log("DEL RET %d %zd", ret, keyVal.mv_size);
+      ret = mdb_txn_commit(txn);
+      if(ret != 0) {
+        loop->defer([onError, ret]() {
+          if(ret == ENOSPC) {
+            onError("outOfDiskSpace");
+            fprintf(stderr, "COMMIT FAILED -- NO MORE DISK SPACE AVAILABLE!\n");
+          }
+          if(ret == EIO) {
+            onError("ioError");
+            fprintf(stderr, "COMMIT FAILED -- IO ERROR!\n");
+          }
+          if(ret == ENOMEM) {
+            onError("outOfMemory");
+            fprintf(stderr, "COMMIT FAILED -- OUT OF MEMORY!\n");
+          }
+          if(ret == EINVAL) {
+            onError("invalidParameter");
+            fprintf(stderr, "COMMIT FAILED -- INVALID PARAMETER!\n");
+          }
+        });
+      }
+      db_log("COMMIT RET %d", ret);
 
       if(getRet != MDB_NOTFOUND) {
         notifyObservers(false, false, key, "");

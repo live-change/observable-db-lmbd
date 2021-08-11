@@ -26,7 +26,9 @@ public:
     mdb_env_set_mapsize(env, 1024*1024*1024);
     mdb_env_set_maxdbs(env, 10000);
     mdb_env_set_maxreaders(env, 32);
-    mdb_env_open(env, path.c_str(), MDB_NOSYNC /*| MDB_NOMETASYNC*/, 0664);
+    mdb_env_open(env, path.c_str(), MDB_NOSYNC | MDB_NOMETASYNC | MDB_WRITEMAP | MDB_NOMEMINIT | MDB_NOTLS
+      /*| MDB_NORDAHEAD | MDB_MAPASYNC*/ ,
+      0664);
   }
 
   void getStore(std::string storeName, std::function<void(std::shared_ptr<Store>)> callback) {
