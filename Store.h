@@ -484,6 +484,23 @@ public:
 
       std::string lastKey = "";
 
+      if(range.flags == 0) { // full count
+        db_log("FULL COUNT!")
+        MDB_stat stat;
+        mdb_stat(txn, dbi, &stat);
+        readCount = stat.ms_entries;
+        if(range.flags & RangeFlag::Reverse) {
+          ret = mdb_cursor_get(cursor, &keyVal, nullptr, MDB_LAST);
+        } else {
+          ret = mdb_cursor_get(cursor, &keyVal, nullptr, MDB_FIRST);
+        }
+        if(ret == 0 && keyVal.mv_size > 0) lastKey = std::string((const char*)keyVal.mv_data, keyVal.mv_size);
+        loop->defer([onCount, readCount, lastKey{ std::move(lastKey) }]() { onCount(readCount, lastKey); });
+        mdb_cursor_close(cursor);
+        mdb_txn_abort(txn);
+        return;
+      }
+
       if(range.flags & RangeFlag::Reverse) {
         if(range.flags & (RangeFlag::Lt | RangeFlag::Lte)) {
           keyVal.mv_size = range.lt.size();
