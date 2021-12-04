@@ -81,6 +81,7 @@ void createDatabase(std::string name, std::string settingsJson,
                     std::function<void()> onOk, std::function<void(std::string)> onError) {
   uWS::Loop* loop = uWS::Loop::get();
   taskQueue.enqueue([name, onOk, onError, loop]() {
+    std::lock_guard<std::mutex> databasesLock(databasesMutex);
     auto it = databases.find(name);
     if(it != databases.end()) {
       loop->defer([onError]() {
@@ -95,6 +96,11 @@ void createDatabase(std::string name, std::string settingsJson,
       return;
     }
     std::filesystem::create_directories(path);
+    loop->defer([onOk]() {
+      onOk();
+    });
+    std::shared_ptr<Database> database = std::make_shared<Database>(path);
+    databases[name] = database;
     loop->defer([onOk]() {
       onOk();
     });

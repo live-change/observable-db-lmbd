@@ -12,6 +12,7 @@
 #include <uWebSockets/Loop.h>
 #include "Store.h"
 #include "taskQueue.h"
+#include <nlohmann/json.hpp>
 
 class Database : public std::enable_shared_from_this<Database> {
 private:
@@ -20,15 +21,37 @@ private:
   std::map<std::string, std::weak_ptr<Store>> stores;
   bool finished = false;
   friend class Store;
+
+  static void readFlag(unsigned int& to, nlohmann::json settings, std::string name, unsigned int flag) {
+    if(settings.contains(name) && settings[name].is_boolean() && settings[name].get<bool>()) {
+      to |= flag;
+    } else {
+      to &= ~flag;
+    }
+  }
+
 public:
-  Database(std::string path) {
+  Database(std::string path, nlohmann::json settings) {
     mdb_env_create(&env);
-    mdb_env_set_mapsize(env, 1024*1024*1024);
+    if(settings.contains("mapSize")) mdb_env_set_mapsize(env, settings["mapSize"].get<std::size_t>());
+    if(settings.contains("maxDbs")) mdb_env_set_maxdbs(env, settings["maxDbs"].get<std::size_t>());
+    if(settings.contains("maxReaders")) mdb_env_set_maxreaders(env, settings["maxReaders"].get<std::size_t>());
+
+    unsigned int flags = 0;
+    /// TOP Speed: MDB_NOSYNC | MDB_NOMETASYNC | MDB_WRITEMAP | MDB_NOMEMINIT | MDB_NOTLS
+    readFlag(flags, settings, "readOnly", MDB_RDONLY);
+    readFlag(flags, settings, "writeMap", MDB_WRITEMAP);
+    readFlag(flags, settings, "noMetaSync", MDB_NOMETASYNC);
+    readFlag(flags, settings, "noSync", MDB_NOSYNC);
+    readFlag(flags, settings, "mapAsync", MDB_MAPASYNC);
+    readFlag(flags, settings, "noReadAhead", MDB_NORDAHEAD);
+    readFlag(flags, settings, "noMemInit", MDB_NOMEMINIT);
+
+    flags |= MDB_NOTLS; /// needed because async
+
     mdb_env_set_maxdbs(env, 10000);
     mdb_env_set_maxreaders(env, 32);
-    mdb_env_open(env, path.c_str(), MDB_NOSYNC | MDB_NOMETASYNC | MDB_WRITEMAP | MDB_NOMEMINIT | MDB_NOTLS
-      /*| MDB_NORDAHEAD | MDB_MAPASYNC*/ ,
-      0664);
+    mdb_env_open(env, path.c_str(), flags,0664);
   }
 
   void getStore(std::string storeName, std::function<void(std::shared_ptr<Store>)> callback) {
