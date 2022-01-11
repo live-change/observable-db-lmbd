@@ -110,7 +110,7 @@ void RangeDataObservation::processOperation(bool found, bool created,
         bool end = (keys.size() == 0) || ((range.flags & RangeFlag::Reverse) ? keys.back() > key : keys.back() < key);
         db_log("KS %zd LT %d E %d", keys.size(), range.limit, end);
         if (keys.size() == range.limit && end) {
-          for(int i = 0; i < keys.size(); i++) {
+          for(unsigned int i = 0; i < keys.size(); i++) {
             db_log("KEY %d : %s", i, keys[i].c_str());
           }
           return; // insert over limit - ignore
@@ -235,7 +235,7 @@ void RangeCountObservation::recount() {
   waitingForRead = true;
   needRecount = false;
   std::shared_ptr<RangeCountObservation> self = shared_from_this();
-  store->getCount(range, [self](int cnt, const std::string& last) {
+  store->getCount(range, [self](unsigned int cnt, const std::string& last) {
     if(self->finished) return;
     db_log("GET COUNT RESULT %d FIRST COUNT %d", cnt, self->firstCount);
     if((self->range.flags & RangeFlag::Limit) && cnt == self->range.limit) {

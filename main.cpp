@@ -70,7 +70,8 @@ void getDatabase(std::string name, std::function<void(std::shared_ptr<Database>)
       });
       return;
     }
-    database = std::make_shared<Database>(path);
+    nlohmann::json settings = nlohmann::json::object();
+    database = std::make_shared<Database>(path, settings);
     databases[name] = database;
     loop->defer([callback, database]() {
       callback(database);
@@ -80,7 +81,7 @@ void getDatabase(std::string name, std::function<void(std::shared_ptr<Database>)
 void createDatabase(std::string name, std::string settingsJson,
                     std::function<void()> onOk, std::function<void(std::string)> onError) {
   uWS::Loop* loop = uWS::Loop::get();
-  taskQueue.enqueue([name, onOk, onError, loop]() {
+  taskQueue.enqueue([name, onOk, onError, loop, settingsJson]() {
     std::lock_guard<std::mutex> databasesLock(databasesMutex);
     auto it = databases.find(name);
     if(it != databases.end()) {
@@ -99,7 +100,8 @@ void createDatabase(std::string name, std::string settingsJson,
     loop->defer([onOk]() {
       onOk();
     });
-    std::shared_ptr<Database> database = std::make_shared<Database>(path);
+    nlohmann::json settings = nlohmann::json::parse(settingsJson);
+    std::shared_ptr<Database> database = std::make_shared<Database>(path, settings);
     databases[name] = database;
     loop->defer([onOk]() {
       onOk();

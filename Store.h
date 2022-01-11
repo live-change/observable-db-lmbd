@@ -376,7 +376,7 @@ public:
       MDB_cursor *cursor;
       mdb_cursor_open(txn, dbi, &cursor);
 
-      int readCount = 0;
+      unsigned int readCount = 0;
       bool isLimited = range.flags & RangeFlag::Limit;
       //db_log("IS LIMITED %d, isLimited);
       int ret;
@@ -456,13 +456,13 @@ public:
   }
 
   void getCount(RangeView rangeView,
-                std::function<void(int, const std::string&)> onCount) {
+                std::function<void(unsigned int, const std::string&)> onCount) {
     Range range(rangeView);
     getCount(range, onCount);
   }
 
   void getCount(Range& range,
-                std::function<void(int, const std::string&)> onCount) {
+                std::function<void(unsigned int, const std::string&)> onCount) {
     std::shared_ptr<Store> self = shared_from_this();
     uWS::Loop* loop = uWS::Loop::get();
     taskQueue.enqueue([loop, self, this, range, onCount{std::move(onCount)}]() {
@@ -477,7 +477,7 @@ public:
       MDB_cursor *cursor;
       mdb_cursor_open(txn, dbi, &cursor);
 
-      int readCount = 0;
+      unsigned int readCount = 0;
       bool isLimited = range.flags & RangeFlag::Limit;
       int ret;
       MDB_val keyVal;
@@ -595,7 +595,7 @@ public:
       MDB_cursor *cursor;
       mdb_cursor_open(txn, dbi, &cursor);
 
-      int readCount = 0;
+      unsigned int readCount = 0;
       bool isLimited = range.flags & RangeFlag::Limit;
       int ret;
       MDB_val keyVal;
